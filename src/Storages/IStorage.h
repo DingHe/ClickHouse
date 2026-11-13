@@ -24,7 +24,14 @@
 #include <optional>
 #include <list>
 
-
+// IStorage 是所有表引擎（Table Engine）的基类（抽象接口类）。它在整个数据库架构中处于核心地位，定义了表在 ClickHouse 中的统一行为契约。
+// IStorage 类的核心职责包括：
+// 数据存储与访问管理：定义数据如何持久化、存储结构（如压缩、列式存储组织）、数据查找（SELECT）以及数据写入（INSERT）。
+// 元数据管理：维护表的列定义、主键、索引、分区键、TTL、备注等元数据信息（通过 StorageInMemoryMetadata）。
+// 并发控制与锁机制：提供表级别的各种锁（共享锁 lockForShare、修改锁 lockForAlter、排他锁 lockExclusively），保证多线程和分布式环境下的并发安全。
+// 生命周期管理：控制表的启动 (startup)、关闭 (shutdown/flushAndShutdown)、删除 (drop)、重命名 (rename) 和清空 (truncate)。
+// 功能特性开关（Capabilities）：通过大量的 supports...() 虚函数，向查询优化器和执行引擎声明当前表引擎支持哪些高级特性（如 PREWHERE、SAMPLE、FINAL、TTL、并行插入、事务、轻量级删除等）。
+// DDL 与运维支持：支持 ALTER、分区操作 (alterPartition)、数据变异 (mutate / updateLightweight)、备份恢复 (backupData / restoreDataFromBackup) 以及后台优化 (optimize)。
 namespace DB
 {
 
@@ -85,43 +92,54 @@ class IStorage : public std::enable_shared_from_this<IStorage>, public TypePromo
 public:
     IStorage() = delete;
     /// Storage metadata can be set separately in setInMemoryMetadata method
+    // 构造函数。
+    // 传入表的唯一标识（数据库名+表名+UUID）以及初始的内存元数据。禁止了无参构造、拷贝构造和赋值操作。
     explicit IStorage(StorageID storage_id_, std::unique_ptr<StorageInMemoryMetadata> metadata_ = nullptr);
 
     IStorage(const IStorage &) = delete;
     IStorage & operator=(const IStorage &) = delete;
 
     /// The main name of the table type (e.g. Memory, MergeTree, CollapsingMergeTree).
+    // 返回表引擎的主名称（例如 "Memory", "MergeTree", "CollapsingMergeTree" 等）
     virtual std::string getName() const = 0;
 
     /// The name of the table.
+    // 获取当前表的 StorageID（包含数据库名和表名）
     StorageID getStorageID() const;
-
+    // 返回该表包含的内部表（Inner Tables）的 ID 列表（例如某些复合引擎或带有子表的引擎）。默认返回空。
     virtual std::vector<StorageID> getInnerStorageIDs() const { return {}; }
-
+    // 指示该表是否属于 MergeTree 家族
     virtual bool isMergeTree() const { return false; }
-
+    // 是否属于数据湖
     virtual bool isDataLake() const { return false; }
 
     /// Returns true if the storage is an external database (MySQL, PostgreSQL, MongoDB, etc.)
+    // 是否属于外部数据库（MySQL/PG等）
     virtual bool isExternalDatabase() const { return false; }
 
     /// Returns true if the storage is object storage (S3, Azure, GCS, HDFS, etc.)
+    // 是否对象存储（S3等）
     virtual bool isObjectStorage() const { return false; }
 
     /// Returns true if the storage is a message queue (Kafka, RabbitMQ, NATS)
+    // 是否消息队列（Kafka等）
     virtual bool isMessageQueue() const { return false; }
 
     /// Returns true if the storage continuously consumes from an external source in the background
     /// (Kafka, RabbitMQ, NATS, S3Queue/AzureQueue).
+    // 是否流式存储
     virtual bool isStreamingStorage() const { return false; }
 
     /// Returns true if the storage receives data from a remote server or servers.
+    // 是否远程表
     virtual bool isRemote() const { return false; }
 
     /// Returns true if the storage is a view of a table or another view.
+    // 是否视图
     virtual bool isView() const { return false; }
 
     /// Returns true if the storage is dictionary
+    // 是否字典
     virtual bool isDictionary() const { return false; }
 
     /// Returns true if the storage supports queries with the SAMPLE section.
@@ -146,7 +164,7 @@ public:
 
     /// Returns true if the storage supports queries with the PREWHERE section.
     virtual bool supportsPrewhere() const { return false; }
-
+    // 获取条件选择率估计器，用于优化查询执行计划中的过滤顺序。
     virtual ConditionSelectivityEstimatorPtr getConditionSelectivityEstimator(const RangesInDataParts &, const Names &, ContextPtr) const;
 
     /// Returns which columns supports PREWHERE, or empty std::nullopt if all columns is supported.
@@ -213,16 +231,18 @@ public:
     virtual bool prefersLargeBlocks() const { return true; }
 
     /// Returns true if the storage is for system, which cannot be target of SHOW CREATE TABLE.
+    // 是否系统表
     virtual bool isSystemStorage() const { return false; }
 
     /// Returns true if asynchronous inserts are enabled for table.
     virtual bool areAsynchronousInsertsEnabled() const { return false; }
-
+    // 是否共享存储
     virtual bool isSharedStorage() const { return false; }
 
     /// Optional size information of each physical column.
     /// Used for query optimizations by the MergeTree family of storages and by Parquet reader.
     using ColumnSizeByName = std::unordered_map<std::string, ColumnSize>;
+    // 获取每个物理列的大小信息（字节数），供 MergeTree 家族或 Parquet 读取器进行查询优化。
     virtual ColumnSizeByName getColumnSizes() const { return {}; }
 
     /// Same as parameterless overload but also includes sizes for the requested subcolumns.
@@ -238,6 +258,7 @@ public:
     /// Optional size information of each secondary index.
     /// Valid only for MergeTree family.
     using IndexSizeByName = std::unordered_map<std::string, IndexSize>;
+    // 获取二级索引的大小信息（仅对 MergeTree 家族有效）
     virtual IndexSizeByName getSecondaryIndexSizes() const { return {}; }
 
     /// Get immutable version (snapshot) of storage metadata. Metadata object is
@@ -245,6 +266,7 @@ public:
     /// used without any locks.
     /// Pass query context to enable metadata caching in MergeTree.
     /// Pass nullptr when no query context is available.
+    // 获取内存中表元数据的不可变快照（Snapshot）。多版本机制保证了获取快照时无需加锁。
     virtual StorageMetadataHandle getInMemoryMetadataPtr(ContextPtr /*context*/, bool /*bypass_metadata_cache*/) const
     {
         return metadata.get();
@@ -253,23 +275,25 @@ public:
     /// Update storage metadata. Used in ALTER or initialization of Storage.
     /// Metadata object is multiversion, so this method can be called without
     /// any locks.
+    // 更新表的内存元数据，常用于 ALTER 操作或表初始化阶段。
     void setInMemoryMetadata(const StorageInMemoryMetadata & metadata_)
     {
         metadata.set(std::make_unique<StorageInMemoryMetadata>(metadata_));
     }
-
+    // 仅更新元数据中的表注释（Comment）。
     void setInMemoryMetadataComment(const String & comment)
     {
         auto updated = std::make_unique<StorageInMemoryMetadata>(*metadata.get());
         updated->setComment(comment);
         metadata.set(std::move(updated));
     }
-
+    // 继承自 IHints，返回所有已注册的列名或其他相关名称，用于拼写错误时提供 HINT 建议。
     VectorWithMemoryTracking<String> getAllRegisteredNames() const override;
-
+    // 获取依赖于该表特定列的物化视图或其他衍生对象映射关系。
     NameDependencies getDependentViewsByColumn(ContextPtr context) const;
 
     /// Modify a CREATE TABLE query to make a variant which must be written to a backup.
+    // 修改 CREATE TABLE 语句，使其生成适用于备份的变体。
     virtual void applyMetadataChangesToCreateQueryForBackup(const ASTPtr & create_query) const;
 
     /// Makes backup entries to backup the data of this storage.
@@ -322,14 +346,17 @@ public:
     virtual void addInferredEngineArgsToCreateQuery(ASTs & /*args*/, const ContextPtr & /*context*/) const {}
 
 private:
+    // 存储当前表的唯一标识（包含数据库名称、表名和表 UUID）。
     StorageID storage_id TSA_GUARDED_BY(id_mutex);
-
+    // 保护 storage_id 的互斥锁，用于多线程安全地访问或修改表的标识。
     mutable std::mutex id_mutex;
 
     /// Multiversion storage metadata. Allows to read/write storage metadata without locks.
+    // 多版本的内存元数据指针。采用多版本并发控制（MVCC），允许在不加锁的情况下并发读取或更新表的元数据（如表结构、列定义等）。
     MultiVersionStorageMetadataPtr metadata;
 
 protected:
+    // 带超时机制的通用读写锁获取辅助方法
     RWLockImpl::LockHolder tryLockTimed(
         const RWLock & rwlock, RWLockImpl::Type type, const String & query_id, const Poco::Timespan & acquire_timeout) const;
 
@@ -338,16 +365,20 @@ public:
     /// that table will be not dropped while you holding this lock. It's used in
     /// variety of cases starting from SELECT queries to background merges in
     /// MergeTree.
+    // 为 SELECT 查询或后台 Merge 等操作加共享锁（Share Lock）。确保在持有锁期间表不会被 DROP。
     TableLockHolder lockForShare(const String & query_id, const Poco::Timespan & acquire_timeout);
 
     /// Similar to lockForShare, but returns a nullptr if the table is dropped while
     /// acquiring the lock instead of raising a TABLE_IS_DROPPED exception
+    // 尝试加共享锁。如果在获取锁的过程中表被删除，则返回 nullptr 而不是抛出 TABLE_IS_DROPPED 异常。
     TableLockHolder tryLockForShare(const String & query_id, const Poco::Timespan & acquire_timeout);
 
     /// Lock table for alter. This lock must be acquired in ALTER queries to be
     /// sure, that we execute only one simultaneous alter. Doesn't affect share lock.
     using AlterLockHolder = std::unique_lock<std::timed_mutex>;
+    // 为 ALTER 操作加锁，确保同一时间只有一个 ALTER 正在执行，且不影响共享锁（SELECT）。
     AlterLockHolder lockForAlter(const Poco::Timespan & acquire_timeout);
+    // 为 DROP、TRUNCATE 等高危操作加排他锁（Exclusive Lock）。此锁极其重，会阻塞所有其他的 SELECT、MERGE、ALTER 线程。
     std::optional<AlterLockHolder> tryLockForAlter(const Poco::Timespan & acquire_timeout);
 
     /// Lock table exclusively. This lock must be acquired if you want to be
@@ -372,6 +403,7 @@ public:
       * QueryProcessingStage::Enum required for Distributed over Distributed,
       * since it cannot return Complete for intermediate queries ever.
       */
+    // 回在 read() 函数中查询将被处理到的阶段（如 FetchColumns、Complete 等），特别适用于分布式表或带有聚合投影的表。
     virtual QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const
     {
         return QueryProcessingStage::FetchColumns;
@@ -396,6 +428,7 @@ public:
      *
      * It is guaranteed that the structure of the table will not change over the lifetime of the returned streams (that is, there will not be ALTER, RENAME and DROP).
      */
+    // 用于“活查询”（Live View / Watch），实时监听表的变动并返回数据流。
     virtual Pipe watch(
         const Names & /*column_names*/,
         const SelectQueryInfo & /*query_info*/,
@@ -406,6 +439,7 @@ public:
 
     /// Returns true if FINAL modifier must be added to SELECT query depending on required columns.
     /// It's needed for ReplacingMergeTree wrappers such as MaterializedPostrgeSQL
+    // 判断是否需要自动为 SELECT 查询追加 FINAL 修饰符（主要用于 ReplacingMergeTree 的包装引擎）。
     virtual bool needRewriteQueryWithFinal(const Names & /*column_names*/) const { return false; }
 
 private:
@@ -429,6 +463,7 @@ private:
       * changed during lifetime of the returned pipeline, but the snapshot is
       * guaranteed to be immutable.
       */
+    // 核心读方法。根据指定的列名、查询信息、上下文、最大块大小和流数量，返回一个或多个数据读取流（Pipe），用于顺序或并行读取数据。
     virtual Pipe read(
         const Names & /*column_names*/,
         const StorageSnapshotPtr & /*storage_snapshot*/,
@@ -446,16 +481,19 @@ private:
     /// This is enabled by default, but in some cases shouldn't be done (for
     /// example it is disabled for all system tables, since it is pretty
     /// useless).
+    // 指示是否在存储层只返回单个读取流后，在外部继续并行化处理输出块（系统表默认关闭）。
     virtual bool parallelizeOutputAfterReading(ContextPtr) const { return !isSystemStorage(); }
 
 public:
     /// Returns an upper bound on the number of sources created for a read request.
     /// The default is conservative: a storage may create one source per requested stream.
+    // 返回为读取请求创建的数据源数量的上限。
     virtual size_t getMaxReadStreams(size_t num_streams, ContextPtr) { return num_streams; }
 
     /// Other version of read which adds reading step to query plan.
     /// Default implementation creates ReadFromStorageStep and uses usual read.
     /// Can be called after `shutdown`, but not after `drop`.
+    // 将“读取数据”这一步直接添加到 ClickHouse 的现代执行计划（QueryPlan）中。默认实现是创建 ReadFromStorageStep。
     virtual void read(
         QueryPlan & query_plan,
         const Names & /*column_names*/,
@@ -477,6 +515,7 @@ public:
       *
       * async_insert - set to true if the write is part of async insert flushing
       */
+    // 核心写方法。接收 INSERT 查询信息和元数据快照，返回一个 SinkToStorage 对象，用于向表中顺序写入数据块。
     virtual SinkToStoragePtr write(
         const ASTPtr & /*query*/,
         const StorageMetadataPtr & /*metadata_snapshot*/,
@@ -493,6 +532,7 @@ public:
       * (with `wait_for_async_insert = 0` the query has already returned success) nor happens with
       * the privileges the user had when the query was issued.
       */
+    // 在发起端（Initiator）检查当前用户是否有权限向该表执行 INSERT（除了表名检查外，针对特定引擎的额外安全校验）。
     virtual void checkInsertIsAllowed(ContextPtr /*context*/) const {}
 
     /** Writes the data to a table in distributed manner.
@@ -501,6 +541,7 @@ public:
       *
       * Returns query pipeline if distributed writing is possible, and nullptr otherwise.
       */
+    // 尝试执行分布式 INSERT SELECT 写入。如果支持，返回对应的查询管道，否则返回 nullptr。
     virtual std::optional<QueryPipeline> distributedWrite(const ASTInsertQuery & /*query*/, ContextPtr /*context*/);
 
     /** Delete the table data. Called before deleting the directory with the data.
@@ -509,8 +550,9 @@ public:
       * If some queries may still use the table, then it must be called under exclusive lock.
       * If you do not need any action other than deleting the directory with data, you can leave this method blank.
       */
+    // 删除表数据。在从 Context 中解耦表之后调用，负责物理删除数据目录等清理工作。
     virtual void drop() {}
-
+    // 如果该表包含内部表（例如某些组合引擎），则同时删除内部表。
     virtual void dropInnerTableIfAny(bool /* sync */, ContextPtr /* context */) {}
 
     /// Return true if the storage supports TRUNCATE operation.
@@ -520,12 +562,13 @@ public:
     /** Clear the table data and leave it empty.
       * Must be called under exclusive lock (lockExclusively).
       */
+    // 清空表数据并保持表结构为空（必须在排他锁下执行）。
     virtual void truncate(
         const ASTPtr & /*query*/,
         const StorageMetadataPtr & /* metadata_snapshot */,
         ContextPtr /* context */,
         TableExclusiveLockHolder &);
-
+    // 检查表是否可以被重命名。
     virtual void checkTableCanBeRenamed(const StorageID & /*new_name*/) const {}
 
     /** Rename the table.
@@ -534,6 +577,7 @@ public:
       * Called when the table structure is locked for write.
       * Table UUID must remain unchanged, unless table moved between Ordinary and Atomic databases.
       */
+    // 重命名表。不仅更新内存和元数据，还要在磁盘上重命名数据目录。
     virtual void rename(const String & /*new_path_to_table_data*/, const StorageID & new_table_id)
     {
         renameInMemory(new_table_id);
@@ -543,30 +587,36 @@ public:
      * Just updates names of database and table without moving any data on disk
      * Can be called directly only from DatabaseAtomic.
      */
+    // 仅在内存中更新数据库名和表名，不移动磁盘数据（专供 DatabaseAtomic 使用）。
     virtual void renameInMemory(const StorageID & new_table_id);
 
     /** ALTER tables in the form of column changes that do not affect the change
       * to Storage or its parameters. Executes under alter lock (lockForAlter).
       */
+    // 执行 ALTER 操作（如修改列、注释等不涉及底层大改动的结构变更）。
     virtual void alter(const AlterCommands & params, ContextPtr context, AlterLockHolder & alter_lock_holder);
 
     /// Updates metadata that can be changed by other processes
     /// Return true if external metadata exists and was updated.
+    // 更新外部动态元数据（如果存在外部源变动）。
     virtual void updateExternalDynamicMetadataIfExists(ContextPtr /* context */) { }
 
     /** Checks that alter commands can be applied to storage. For example, columns can be modified,
       * or primary key can be changes, etc.
       */
+    // 校验给定的 ALTER 命令是否可以安全应用到该存储引擎。
     virtual void checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const;
 
     /**
       * Checks that mutation commands can be applied to storage.
       */
+    // 校验变异命令（Mutation）是否被支持并可应用。
     virtual void checkMutationIsPossible(const MutationCommands & commands, const Settings & settings) const;
 
     /** ALTER tables with regard to its partitions.
       * Should handle locks for each command on its own.
       */
+    // 执行或校验表分区级别的 ALTER 操作（如 DROP PARTITION, DETACH PARTITION 等）。
     virtual Pipe alterPartition(
         const StorageMetadataPtr & /* metadata_snapshot */,
         const PartitionCommands & /* commands */,
@@ -582,6 +632,7 @@ public:
     /** Perform any background work. For example, combining parts in a MergeTree type table.
       * Returns whether any work has been done.
       */
+    // 执行后台维护或优化工作（例如 MergeTree 中的合并数据片段、去重、清理等）。
     virtual bool optimize(
         const ASTPtr & /*query*/,
         const StorageMetadataPtr & /*metadata_snapshot*/,
@@ -629,6 +680,7 @@ public:
       * @see shutdown()
       * @see flushAndPrepareForShutdown()
       */
+    // 在 shutdown() 之前调用，将内存中的数据持久化到底层存储，并停止会影响其他表的后台工作（如物化视图刷新）。
     void flushAndShutdown(bool is_drop = false)
     {
         flushAndPrepareForShutdown();
@@ -640,6 +692,7 @@ public:
       * By default, does nothing.
       * Can be called simultaneously from different threads, even after a call to drop().
       */
+    // 销毁表对象前的收尾工作，主要用于请求并等待所有后台工作线程退出。
     virtual void shutdown(bool is_drop = false) { UNUSED(is_drop); } // NOLINT
 
     /// Called before shutdown() to flush data to underlying storage.
