@@ -28,15 +28,20 @@ void ISource::cancel(CancelReason) noexcept
     onCancel();
 }
 
+// prepare() 是数据源算子（ISource）的核心状态机准备方法。
+// 调度器（Pipeline Executor）会周期性地调用该方法，以检查数据源当前的运行状态，并根据返回的 Status 枚举决定 下一步是调用 work()、等待端口可用、还是结束执行。
 ISource::Status ISource::prepare()
 {
+	// 检查数据源是否已在本地标记为结束
     if (finished)
     {
+		// 关闭输出端口，通知下游不会再有新数据产生
         output.finish();
         return Status::Finished;
     }
 
     /// Check can output.
+	// 检查输出端口的下游接收状态
     if (output.isFinished())
         return Status::Finished;
 
@@ -45,8 +50,9 @@ ISource::Status ISource::prepare()
 
     if (!has_input)
         return Status::Ready;
-
+	// 向输出端口推送缓存的数据块
     output.pushData(std::move(current_chunk));
+	// 表示缓存已被清空
     has_input = false;
 
     if (isCancelled())
@@ -106,18 +112,21 @@ void ISource::addTotalBytes(size_t value)
     std::lock_guard lock(read_progress_mutex);
     read_progress.total_bytes += value;
 }
-
+// ISource::work() 是数据源算子（ISource）的核心执行方法。当 prepare() 返回 Status::Ready 时，调度器（Pipeline Executor）会调用该方法。
+// 主要职责是：执行实际的数据生成工作（调用底层表扫描或生成逻辑）、更新读取进度、捕获异常，并处理数据源的正常或异常终止。
 void ISource::work()
 {
     try
     {
+		// 如果当前数据源已经处于结束状态，直接返回，避免重复执行。
         if (finished)
             return;
-
+		// 重置进度已设置的标志，准备迎接本次生成的进度统计。
         read_progress_was_set = false;
-
+		// 调用虚函数 tryGenerate() 尝试获取下一个数据块。由于返回类型是 std::optional<Chunk>：
         if (auto chunk = tryGenerate())
         {
+			// 将生成的 Chunk 移动到本地缓存 current_chunk 中。
             current_chunk.chunk = std::move(*chunk);
             if (current_chunk.chunk)
             {

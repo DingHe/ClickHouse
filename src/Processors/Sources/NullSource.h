@@ -5,6 +5,8 @@
 namespace DB
 {
 
+// 主要用于没有数据需要读取的情况。
+// 例如 SELECT * FROM t WHERE 1 = 0;
 class NullSource final : public ISource
 {
 public:

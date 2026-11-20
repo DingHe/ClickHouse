@@ -8,10 +8,17 @@
 
 namespace DB
 {
+// Chunk.h 定义了算子（IProcessor）之间在端口（Port）中实际流转的数据载体。整个文件除了核心的 Chunk 类外，还包含了用于附加元数据的 ChunkInfo 体系以及一组列格式转换辅助函数。
+// Chunk（核心数据块载体）
+// 轻量级数据容器：它是一组等长列（Columns）和行数（num_rows）的集合。与传统的 Block 相比，Chunk 不存储列名、数据类型和名称索引映射（这些元数据已被抽离到端口的 Header 中），因此极其轻量，极大降低了流水线传输时的元数据拷贝与维护开销。
+// 严格的仅移动语义（Move-only）：禁止隐式拷贝构造和拷贝赋值，强制通过 std::move 在算子间零拷贝转移所有权；若确实需要复制，必须显式调用 clone()。
+// 灵活的空状态语义：允许“有行数但无列”（例如 SELECT count() 只需传递行数）和“有列但 0 行”（例如过滤后无匹配行但需保留列结构），只有当“0 行且 0 列”时才被视为空（empty()）。
 
+// 元数据抽象基类
 class ChunkInfo
 {
 public:
+    // 定义智能指针类型别名。
     using Ptr = std::shared_ptr<ChunkInfo>;
 
     ChunkInfo() = default;
@@ -19,6 +26,7 @@ public:
     ChunkInfo(ChunkInfo&&) = default;
 
     virtual Ptr clone() const = 0;
+    // 虚函数，定义当两个 Chunk 合并（append）时，它们各自携带的 ChunkInfo 该如何合并。默认实现直接返回右侧的 right。
     virtual Ptr merge(const Ptr & right) const
     {
         return right; // merge left into right by default returns right
@@ -26,10 +34,11 @@ public:
     virtual ~ChunkInfo() = default;
 };
 
-
+// CRTP 克隆模板辅助类
 template <typename Derived>
 class ChunkInfoCloneable : public ChunkInfo
 {
+    // 利用奇异递归模板模式（CRTP），防止误用，确保只有 Derived 自身能构造。
     friend Derived;
 
 private:
@@ -37,6 +46,7 @@ private:
     ChunkInfoCloneable(const ChunkInfoCloneable & other) = default;
 
 public:
+    // 自动通过 std::make_shared<Derived>(*static_cast<const Derived*>(this)) 实现多态克隆，免去每个具体 ChunkInfo 子类重复编写 clone() 样板代码。
     Ptr clone() const override
     {
         return std::static_pointer_cast<ChunkInfo>(std::make_shared<Derived>(*static_cast<const Derived*>(this)));
@@ -61,9 +71,10 @@ class Chunk
 {
 public:
     using ChunkInfoCollection = CollectionOfDerivedItems<ChunkInfo>;
-
+    // 默认构造函数，创建一个 0 行 0 列的空 Chunk。
     Chunk() = default;
     Chunk(const Chunk & other) = delete;
+    // 移动构造函数。将 other 的 columns、num_rows 和 chunk_infos 转移给当前对象，并将 other.num_rows 重置为 0。
     Chunk(Chunk && other) noexcept
         : columns(std::move(other.columns))
         , num_rows(other.num_rows)
@@ -71,11 +82,13 @@ public:
     {
         other.num_rows = 0;
     }
-
+    // 构造函数，接收不可变列集合（Columns）和行数，并校验行数一致性。
     Chunk(Columns columns_, UInt64 num_rows_);
+    // 构造函数，接收可变列集合（MutableColumns）和行数，将其转换为不可变列并校验一致性。
     Chunk(MutableColumns columns_, UInt64 num_rows_);
 
     Chunk & operator=(const Chunk & other) = delete;
+    // 移动赋值运算符。接管 other 的所有资源，并将 other.num_rows 清零，返回 *this。
     Chunk & operator=(Chunk && other) noexcept
     {
         columns = std::move(other.columns);
@@ -86,7 +99,7 @@ public:
     }
 
     Chunk clone() const;
-
+    // 高效交换两个 Chunk 的 columns、num_rows 和 chunk_infos，无异常抛出。
     void swap(Chunk & other) noexcept
     {
         columns.swap(other.columns);
@@ -133,10 +146,13 @@ public:
     void append(const Chunk & chunk, size_t from, size_t length); // append rows [from, from+length) of chunk
 
 private:
+    // 存储底层列数据指针的数组（std::vector<ColumnPtr>），所有列必须保持相同的行数（或为合法的常量/稀疏表示）。
     Columns columns;
+    // 独立记录当前数据块的行数。即使 columns 为空，该字段依然可以独立记录有效行数。
     UInt64 num_rows = 0;
+    // 存储附加在当前 Chunk 上的多态 ChunkInfo 集合（基于派生类类型索引）。
     ChunkInfoCollection chunk_infos;
-
+    // 内部一致性校验方法，检查 columns 中每一列的实际大小是否与 num_rows 严格一致，不一致时抛出逻辑异常。
     void checkNumRowsIsConsistent();
 };
 
@@ -145,6 +161,7 @@ using Chunks = std::vector<Chunk>;
 /// AsyncInsert needs two kinds of information:
 /// - offsets of different sub-chunks
 /// - tokens of different sub-chunks, which are assigned by setting `insert_deduplication_token`.
+// 异步插入元数据子类
 class AsyncInsertInfo : public ChunkInfoCloneable<AsyncInsertInfo>
 {
 public:
@@ -154,8 +171,9 @@ public:
         : offsets(offsets_)
         , tokens(tokens_)
     {}
-
+    // 记录合并批次中各个子数据块（sub-chunks）的行偏移位置。
     std::vector<size_t> offsets;
+    // 记录各个子数据块对应的去重 Token（由 insert_deduplication_token 指定）。
     std::vector<String> tokens;
 };
 

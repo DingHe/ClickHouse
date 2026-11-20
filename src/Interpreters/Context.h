@@ -357,63 +357,89 @@ private:
 
     void lockSharedImpl();
 };
+// 承载了整个执行上下文的全部状态数据
+// 为了避免 Context 庞大的 getter/setter 方法群与状态字段混杂在一起，ClickHouse 将所有非全局共享的、特定于会话（Session）或单次查询（Query）的状态字段抽离到了 ContextData 中，
+// 而把真正的全局单例状态（如磁盘配置、线程池、ZooKeeper 连接等）存放在它指向的 ContextSharedPart 中。
+// ContextData 类的作用
+// 会话与查询状态的数据载体：作为 Context 的底层存储基类，封装了从客户端连接认证、权限角色、SQL 配置参数（Settings）、临时表与标量、分布式协同回调、事务上下文，到执行进度追踪与资源限流器的全生命周期状态。
+// 支持轻量级上下文派生（Copy-on-Create）：当从 global_context 派生 session_context，再从 session_context 派生 query_context 或子查询上下文时，通过调用 ContextData(const ContextData &) 拷贝构造函数快速继承父级配置与状态，同时共享同一个 ContextSharedPart * shared 全局指针。
+// 提供审计与可观测性记录容器：内置 QueryAccessInfo、QueryFactoriesInfo、QueryPrivilegesInfo 和 KitchenSink 等线程安全的嵌套结构体，用于收集单次查询访问了哪些库表列、使用了哪些函数与权限，最终写入 system.query_log。
 
 class ContextData
 {
 protected:
+    // 指向全局共享上下文单例的裸指针，存放整个 ClickHouse 实例唯一的全局配置、磁盘、后台线程池等。
     ContextSharedPart * shared{};
-
+    // 客户端连接信息（包含初始查询 ID、当前查询 ID、客户端 IP/端口、用户代理、查询类型 INITIAL_QUERY/SECONDARY_QUERY、以及 HTTP 处理器名称与请求 URL）。
     ClientInfo client_info;
+    // 延迟初始化 GLOBAL IN/JOIN 外部临时表的回调函数。
     ExternalTablesInitializer external_tables_initializer_callback;
+    // 分布式查询中用于反序列化远端发来的 QueryPlan 的回调函数。
     QueryPlanDeserializationCallback query_plan_deserialization_callback;
-
+    // 分布式查询中用于反序列化远端发来的 QueryPlan 的回调函数。
     InputInitializer input_initializer_callback;
     InputBlocksReader input_blocks_reader;
-
+    // user_id
     std::optional<UUID> user_id;
+    // 当前激活的本地角色 UUID 列表，以及通过外部认证系统（如 LDAP/Kerberos）映射的角色列表。
     std::shared_ptr<std::vector<UUID>> current_roles;
     std::shared_ptr<std::vector<UUID>> external_roles;
     /// If not null, the access rights are limited to the intersection with these elements.
     /// This comes from the GRANTS clause of the authentication method the user logged in with.
+    // 登录认证方式附带的 GRANTS 权限交集限制（若非空，用户有效权限不能超出此范围）。
     std::shared_ptr<const AccessRightsElements> authentication_grants;
     /// Expiry (VALID UNTIL) of the authentication method the user logged in with, 0 if none.
     /// Carried alongside `authentication_grants` so deferred-execution paths (asynchronous insert
     /// flush, `QueryRunner` invoker jobs) can fail closed if the credential has expired between
     /// enqueue and execution; the synchronous path re-checks it per query in
     /// `Session::makeQueryContextImpl` (via `Session::checkIfUserIsStillValid`) for every protocol.
+    // 认证凭据的过期时间戳（VALID UNTIL），用于异步插入刷盘或后台调度任务在延迟执行时验证凭据是否已过期。
     time_t authentication_valid_until = 0;
+    // 当前生效的 Settings 约束范围（最小/最大值/只读限制）及配置 Profile ID 列表。
     std::shared_ptr<const SettingsConstraintsAndProfileIDs> settings_constraints_and_current_profiles;
+    // 缓存的当前用户权限计算结果对象 ContextAccess 及其脏标记（当角色或用户变更时置为 true 触发惰性重算）。
     mutable std::shared_ptr<const ContextAccess> access;
     mutable bool need_recalculate_access = true;
+    // 当前会话默认的数据库名称（执行 USE db 后更新）。
     String current_database;
     /// The SQL-defined HTTP handler name and the HTTP request URL are stored in `client_info` (see
     /// `ClientInfo::http_handler_name` / `http_request_url`) so that they are serialized on distributed
     /// fan-out and remain visible to `currentHandler()` / `currentRequestURL()` on remote shards.
+    // 当前会话默认的数据库名称（执行 USE db 后更新）。
     bool can_use_query_result_cache = false;
+    // 当前会话或查询生效的所有配置参数集合（Settings）。
     std::unique_ptr<Settings> settings{};  /// Setting for query execution.
 
     using ProgressCallback = std::function<void(const Progress & progress)>;
+    // 查询行/字节处理进度回调，以及外部文件加载进度回调。
     ProgressCallback progress_callback;  /// Callback for tracking progress of query execution.
 
     using FileProgressCallback = std::function<void(const FileProgress & progress)>;
     FileProgressCallback file_progress_callback; /// Callback for tracking progress of file loading.
-
+    // 交互式会话（如 clickhouse-client 或 HTTP 流式执行）中用于检测客户端是否发起取消的回调函数。
     using InteractiveCancelCallback = std::function<bool()>;
     InteractiveCancelCallback interactive_cancel_callback; /// Callback for usage in interactive sessions with CompletedPipelineExecutor
 
     std::weak_ptr<QueryStatus> process_list_elem;  /// For tracking total resource usage for query.
     bool has_process_list_elem = false;     /// It's impossible to check if weak_ptr was initialized or not
+    // 归一化（去除字面量常量）后的 SQL 哈希值，用于按查询指纹维度计算资源配额（NORMALIZED_QUERY_HASH）。
     UInt64 normalized_query_hash = 0;       /// Hash of the normalized query text, used for `NORMALIZED_QUERY_HASH` quotas.
+
+    // 保存当前 INSERT 查询的目标表元信息：
     struct InsertionTableInfo
     {
+        // 目标插入表的库名、表名和 UUID。
         StorageID table = StorageID::createEmpty();
+        // 显式指定的待插入列名列表（若未指定则为空）。
         std::optional<Names> column_names;
+        // 目标表的列结构描述信息。
         std::shared_ptr<ColumnsDescription> columns_description;
     };
 
     InsertionTableInfo insertion_table_info;  /// Saved information about insertion table in query context
+    // 标记当前上下文是否正用于分布式查询执行。
     bool is_distributed = false;  /// Whether the current context it used for distributed query
-
+    // 当 SQL 未显式指定 FORMAT 时使用的默认输出格式（常用于 HTTP 接口），以及 INSERT 语句的默认解析格式。
     String default_format;  /// Format, used when server formats data by itself and if query does not have FORMAT specification.
                             /// Thus, used in HTTP interface. If not specified - then some globally default format is used.
 
@@ -423,34 +449,41 @@ protected:
     /// parameters, unrecognized URL parameters as filters), already combined with `AND`. Kept
     /// separate from the `filter` setting so it composes with — rather than being overwritten by —
     /// an in-query `SETTINGS filter = ...` clause when query-construction settings are applied.
+    // HTTP 接口通过 URL 路径或 ?filter= 参数传入的额外行过滤条件（以 AND 拼接），独立保存以防止被查询内的 SETTINGS filter = ... 覆盖。
     String http_combined_filter;
-
+    // 当前会话或查询中注册的临时表（CREATE TEMPORARY TABLE 或 GLOBAL 子查询传输的外部表）映射。
     TemporaryTablesMapping external_tables_mapping;
+    // 用于查询分析/优化阶段的假设对象存储元数据缓存。
     mutable std::shared_ptr<HypotheticalObjectStore> hypothetical_object_store;
     /// Query scalars
+    // 预计算的标量子查询结果字典（如 WITH (SELECT ...) AS x），以及在分布式计划中每个节点值不同的特殊标量（如 _shard_num）。
     Scalars scalars;
     /// Used to store constant values which are different on each instance during distributed plan, such as _shard_num.
     Scalars special_scalars;
 
     /// Mapping between identifiers and time series tags collected in the context of the currently executed query.
+    // 时序引擎查询中收集标识符与时间序列标签映射的收集器。
     std::shared_ptr<ContextTimeSeriesTagsCollector> time_series_tags_collector;
 
     /// Used in s3Cluster table function. With this callback, a worker node could ask an initiator
     /// about next file to read from s3.
+    // 等集群表函数中，工作节点向发起节点请求下一个待读取文件的回调。
     std::optional<ClusterFunctionReadTaskCallback> next_task_callback;
     /// Used in parallel reading from replicas. A replica tells about its intentions to read
     /// some ranges from some part and initiator will tell the replica about whether it is accepted or denied.
+    // 多副本并行读取（Parallel Replicas）中，副本向协调器声明读取范围、申请读取任务以及标识并行副本组的 UUID。
     std::optional<MergeTreeReadTaskCallback> merge_tree_read_task_callback;
     std::optional<MergeTreeAllRangesCallback> merge_tree_all_ranges_callback;
     UUID parallel_replicas_group_uuid{UUIDHelpers::Nil};
-
+    // 并行反序列化/序列化数据块的回调。
     BlockMarshallingCallback block_marshalling_callback;
 
     mutable RuntimeDataflowStatisticsCacheUpdaterPtr dataflow_cache_updater;
-
+    // 标记当前是否正处于 RESTORE 备份恢复流程中。
     bool is_under_restore = false;
 
     /// This parameter can be set by the HTTP client to tune the behavior of output formats for compatibility.
+    // HTTP 客户端传入的协议版本号，用于微调输出格式以保持向后兼容。
     UInt64 client_protocol_version = 0;
 
     /// Max block numbers in partitions to read from MergeTree tables.
@@ -464,6 +497,7 @@ protected:
 
 public:
     /// Record entities accessed by current query, and store this information in system.query_log.
+    // 线程安全地记录当前查询访问的所有数据库实体，用于审计日志（system.query_log）：
     struct QueryAccessInfo
     {
         QueryAccessInfo() = default;
@@ -502,7 +536,9 @@ public:
         }
 
         /// To prevent a race between copy-constructor and other uses of this structure.
+        // 保护内部各集合并发写入的互斥锁。
         mutable std::mutex mutex{};
+        // 7 个 std::set<std::string> 集合（均受 mutex 保护），分别记录查询涉及的数据库、表、列、分区、投影（Projection）、视图以及行级安全策略（Row Policy）名称。
         std::set<std::string> databases TSA_GUARDED_BY(mutex){};
         std::set<std::string> tables TSA_GUARDED_BY(mutex){};
         std::set<std::string> columns TSA_GUARDED_BY(mutex){};
@@ -520,6 +556,7 @@ protected:
 
 public:
     /// Record names of created objects of factories (for testing, etc)
+    // 线程安全地记录查询执行期间通过各类工厂（Factory）动态创建的所有组件名称（用于测试、插件审计及系统表统计）：
     struct QueryFactoriesInfo
     {
         QueryFactoriesInfo() = default;
@@ -541,7 +578,8 @@ public:
         }
 
         QueryFactoriesInfo(QueryFactoriesInfo && rhs) = delete;
-
+        // 11 个 std::unordered_set<std::string> 集合（均受 mutex 保护）：分别记录创建的聚合函数（aggregate_functions）、聚合函数组合器（aggregate_function_combinators）、数据库引擎（database_engines）、数据类型族（data_type_families）、字典（dictionaries）、输入输出格式（formats）、普通函数（functions）、
+        // 表引擎（storages）、表函数（table_functions）、可执行自定义函数（executable_user_defined_functions）以及 SQL 自定义函数（sql_user_defined_functions）。
         std::unordered_set<std::string> aggregate_functions TSA_GUARDED_BY(mutex);
         std::unordered_set<std::string> aggregate_function_combinators TSA_GUARDED_BY(mutex);
         std::unordered_set<std::string> database_engines TSA_GUARDED_BY(mutex);
@@ -553,10 +591,10 @@ public:
         std::unordered_set<std::string> table_functions TSA_GUARDED_BY(mutex);
         std::unordered_set<std::string> executable_user_defined_functions TSA_GUARDED_BY(mutex);
         std::unordered_set<std::string> sql_user_defined_functions TSA_GUARDED_BY(mutex);
-
+        // 并发访问保护锁。
         mutable std::mutex mutex;
     };
-
+    // 线程安全地记录查询执行过程中的权限校验结果：
     struct QueryPrivilegesInfo
     {
         QueryPrivilegesInfo() = default;
@@ -569,10 +607,11 @@ public:
         }
 
         QueryPrivilegesInfo(QueryPrivilegesInfo && rhs) = delete;
-
+        // 已成功校验并使用的权限集合。
         std::unordered_set<std::string> used_privileges TSA_GUARDED_BY(mutex);
+        // 权限检查失败时缺失的权限集合。
         std::unordered_set<std::string> missing_privileges TSA_GUARDED_BY(mutex);
-
+        // 保护上述两个集合的互斥锁。
         mutable std::mutex mutex;
     };
 
@@ -589,7 +628,7 @@ protected:
     StoragePtr view_source;                 /// Temporary StorageValues used to generate alias columns for materialized views
     Tables table_function_results;          /// Temporary tables obtained by execution of table functions. Keyed by AST tree id.
     mutable std::mutex table_function_results_mutex;
-
+    // 分别指向当前查询上下文、所属会话上下文、全局上下文以及后台任务上下文的弱引用指针（使用 weak_ptr 避免循环引用导致内存泄漏）。
     ContextWeakMutablePtr query_context;
     ContextWeakMutablePtr session_context;      /// Session context or nullptr. Could be equal to this.
     ContextWeakMutablePtr global_context;       /// Global context. Could be equal to this.
@@ -599,16 +638,20 @@ protected:
     ContextMutablePtr buffer_context;  /// Buffer context. Could be equal to this.
 
     /// A flag, used to distinguish between user query and internal query to a database engine (MaterializedPostgreSQL).
+    // 区分用户发起的查询与数据库引擎（如 MaterializedPostgreSQL）发起的内部查询。
     bool is_internal_query = false;
     /// A flag, used to detect sub-operations of background operations - in this case we won't need to build another background contexts
+    // 标记当前是否正处于后台操作（如 Merge、Mutation）及其子操作中，避免重复创建后台上下文。
     bool is_background_operation = false;
     /// Set for queries created internally by the server for DDL replication (ON CLUSTER, DatabaseReplicated)
     /// and internal backup coordination.
     /// Unlike query_kind == SECONDARY_QUERY (which comes from the client and can be spoofed),
     /// this flag can only be set server-side and is safe to use for security-sensitive checks.
+    // 仅在服务端内部执行 ON CLUSTER DDL 复制或内部备份协调时置为 true（不可由客户端伪造，用于安全敏感操作鉴权）。
     bool is_ddl_or_on_cluster_internal = false;
     /// Set for CREATE queries a Replicated database replays from a definition it already stored.
     /// Such a definition describes existing state, so validation that may reject a new one must not run.
+    // 仅在服务端内部执行 ON CLUSTER DDL 复制或内部备份协调时置为 true（不可由客户端伪造，用于安全敏感操作鉴权）。
     bool is_recovery_from_stored_metadata = false;
     /// True when this context belongs to the inner query of an expanded view.
     /// Positional arguments inside views must be resolved even on remote/secondary nodes where
@@ -627,24 +670,28 @@ protected:
     JoinAnalyzeMode join_analyze_mode = JoinAnalyzeMode::None;
 
     /// Defined out of line: a definition in the header gives every shared object its own copy.
+    // 两个静态全局变量（定义在 .cpp 中），持有全局上下文和后台上下文的强引用所有权，维持其在整个进程生命周期内有效。
     static ContextPtr global_context_instance;
     static ContextPtr background_context_instance;   /// Global holder to maintain ownership of background_context
 
     /// Temporary data for query execution accounting.
+    // 查询执行期间溢写到磁盘的临时数据（如外部排序、外部聚合）空间配额追踪器。
     TemporaryDataOnDiskScopePtr temp_data_on_disk;
 
     /// Resource classifier for a query, holds smart pointers required for ResourceLink
     /// NOTE: all resource links became invalid after `classifier` destruction
+    // 查询的 I/O 资源调度分类器（用于工作负载隔离与带宽/并发控制）。
     mutable ClassifierPtr classifier;
 
     /// Prepared sets that can be shared between different queries. One use case is when is to share prepared sets between
     /// mutation tasks of one mutation executed against different parts of the same table.
     PreparedSetsCachePtr prepared_sets_cache;
-
+    // 分片式（Sharded）线程安全表存在性缓存，减少高频查询中对全局目录锁的争用：
     struct StorageCache
     {
+        // 固定划分为 6 个分片槽位。
         static constexpr size_t NumShards = 6;
-
+        // 每个分片包含一个独立的 std::mutex mutex 和一个以数据库名+表名为哈希键的 std::unordered_set<StorageID, ...> set。
         struct Shard
         {
             std::mutex mutex;
@@ -654,9 +701,9 @@ protected:
                 StorageID::DatabaseAndTableNameEqual
             > set;
         };
-
+        // 分片数组。
         std::array<Shard, NumShards> shards;
-
+        // 静态哈希分片路由函数，根据库表名哈希值对 NumShards 取模计算槽位索引。
         static size_t shardIndex(const StorageID & id)
         {
             return StorageID::DatabaseAndTableNameHash{}(id) % NumShards;
@@ -669,6 +716,7 @@ protected:
     mutable ReverseLookupCachePtr reverse_lookup_cache;
 
     /// AI-function quota usage for the current query, shared by every AI function call in it.
+    // 当前查询调用 AI 函数的配额使用追踪器。
     mutable AIQuotaTrackerPtr ai_quota_tracker;
 
     /// this is a mode of parallel replicas where we set parallel_replicas_count and parallel_replicas_offset
@@ -682,8 +730,10 @@ protected:
 public:
     /// Some counters for current query execution.
     /// Most of them are workarounds and should be removed in the future.
+    // 存放杂项/临时性查询执行计数器（注释注明未来可能会重构移除）：
     struct KitchenSink
     {
+        // 原子计数器，记录查询分析器（Analyzer）的遍历或递归次数。
         std::atomic<size_t> analyze_counter = 0;
 
         KitchenSink() = default;
@@ -719,10 +769,10 @@ protected:
     mutable std::mutex sample_block_cache_mutex;
 
     QueryMetadataCacheWeakPtr query_metadata_cache;
-
+    // 参数化查询（Prepared Statements / {param:Type}）的参数名值映射字典。
     NameToNameMap query_parameters;   /// Dictionary with query parameters for prepared statements.
                                                      /// (key=name, value)
-
+    // 宿主上下文扩展接口指针，当 ClickHouse 作为嵌入式库（如 chDB）集成到其他宿主程序时，用于挂载宿主自定义的日志、追踪或剖析对象。
     IHostContextPtr host_context;  /// Arbitrary object that may used to attach some host specific information to query context,
                                    /// when using ClickHouse as a library in some project. For example, it may contain host
                                    /// logger, some query identification information, profiling guards, etc. This field is
@@ -747,7 +797,7 @@ protected:
     /// Use copy constructor or createGlobal() instead
     ContextData();
     ContextData(const ContextData &);
-
+    // 五个查询级网络/磁盘带宽限流器，分别控制远程读、远程写、本地磁盘读、本地磁盘写以及备份任务的吞吐速率。
     mutable ThrottlerPtr remote_read_query_throttler;       /// A query-wide throttler for remote IO reads
     mutable ThrottlerPtr remote_write_query_throttler;      /// A query-wide throttler for remote IO writes
 
@@ -767,22 +817,29 @@ protected:
   *
   * Everything is encapsulated for all sorts of checks and locks.
   */
+// 贯穿整个查询解析、分析、计划优化与执行流水线的全局中枢对象。
+// 统一上下文门面（Facade）：为 SQL 解释器（Interpreter）、查询分析器（Analyzer）、执行算子（Processor）、表引擎（Storage）和函数（Function）提供获取配置、权限、连接、字典、临时表、事务、限流器等一切运行时依赖的唯一标准入口。
+// 层级上下文管理：支持多级上下文派生（Global Context -> Session Context -> Query Context -> Subquery Context）。通过工厂方法 createCopy() 快速复制局部状态（ContextData），同时安全共享底层的全局单例资源（ContextSharedPart）。
+// 细粒度并发控制与锁封装：内部持有读写锁 ContextSharedMutex mutex，确保多线程并发修改或读取上下文状态（如设置参数、添加临时表、记录审计日志）时的线程安全。
 class Context: public ContextData, public std::enable_shared_from_this<Context>
 {
 private:
     /// ContextData mutex
+    // 读写互斥锁（SharedMutex），用于保护继承自 ContextData 的非原子成员变量在多线程环境下的安全读写（读操作加共享锁，写操作加独占锁）。
     mutable ContextSharedMutex mutex;
 
     Context();
     Context(const Context &);
-
+    // 设置内置 ClickHouse Keeper 的调度器实例。
 #if USE_NURAFT
     void setKeeperDispatcher(std::shared_ptr<KeeperDispatcher> dispatcher) const;
 #endif
 
 public:
     /// Create initial Context with ContextShared and etc.
+    // 创建服务器唯一的全局根上下文，绑定全局共享组件 shared_part。
     static ContextMutablePtr createGlobal(ContextSharedPart * shared_part);
+    // 从已有的上下文（支持弱指针、可变强指针、常量强指针三种重载）派生出一个新的可变上下文副本（常用于为新连接创建会话上下文，或为每条 SQL 创建独立的查询上下文）。
     static ContextMutablePtr createCopy(const ContextWeakPtr & other);
     static ContextMutablePtr createCopy(const ContextMutablePtr & other);
     static ContextMutablePtr createCopy(const ContextPtr & other);
@@ -790,12 +847,17 @@ public:
 
 
     ~Context();
-
+    // 获取或设置 ClickHouse 主数据根目录路径（默认 /var/lib/clickhouse/）。
     String getPath() const;
+    // 获取或设置标志文件目录路径（用于触发恢复等运维操作）。
     String getFlagsPath() const;
+    // 获取或设置 file() 表函数允许访问的用户文件根目录。
     String getUserFilesPath() const;
+    // 获取或设置 file() 表函数允许访问的用户文件根目录。
     String getUserScriptsPath() const;
+    // 获取或设置动态加载的可执行 UDF 配置文件目录路径。
     String getDynamicUserDefinedExecutableFunctionsPath() const;
+    // 获取或设置本地文件系统缓存（Filesystem Cache）的存储路径及操作用户。
     String getFilesystemCachesPath() const;
     String getFilesystemCacheUser() const;
 
@@ -807,11 +869,13 @@ public:
     void dropStorageCacheEntry(const StorageID & id) const;
 
     // Get the disk used by databases to store metadata files.
+    // 获取数据库引擎用于存储表元数据（.sql 文件）的底层磁盘对象 IDisk。
     std::shared_ptr<IDisk> getDatabaseDisk() const;
 
     /// Different kinds of warnings available for use with the `system.warnings` table.
     /// More can be added as necessary. These are used to track if a warning is already
     /// present to be able to add, remove or update warnings from the table
+    // 定义可在系统表 system.warnings 中展示的 40 余种服务器运行期告警类型（如磁盘/内存过低、调试模式构建、Linux 内核参数未优化、过时设置或表引擎、活跃 Part 过多等）。
     enum class WarningType
     {
         AST_FUZZER_IS_ENABLED,
@@ -866,7 +930,7 @@ public:
     void removeAllWarnings() const;
 
     VolumePtr getGlobalTemporaryVolume() const; /// TODO: remove, use `getTempDataOnDisk`
-
+    // 获取查询级或全局共享的磁盘临时数据空间管理器（用于外部排序、外部聚合溢写），或设置当前查询的临时空间作用域。
     TemporaryDataOnDiskScopePtr getTempDataOnDisk() const;
     TemporaryDataOnDiskScopePtr getSharedTempDataOnDisk() const;
     void setTempDataOnDisk(TemporaryDataOnDiskScopePtr temp_data_on_disk_);
@@ -898,6 +962,7 @@ public:
     const AccessControl & getAccessControl() const;
 
     /// Sets external authenticators config (LDAP, Kerberos).
+    // 设置 LDAP/Kerberos 等外部认证器配置，以及创建 Kerberos GSS 认证接收器上下文。
     void setExternalAuthenticatorsConfig(const Poco::Util::AbstractConfiguration & config);
 
     /// Creates GSSAcceptorContext instance based on external authenticator params.
@@ -907,6 +972,7 @@ public:
       * The list of users is completely replaced.
       * The accumulated quota values are not reset if the quota is not deleted.
       */
+    // 加载或获取 users.xml 中的用户、配额和配置 Profile 定义（替换用户列表但保留配额累计值）。
     void setUsersConfig(const ConfigurationPtr & config);
     ConfigurationPtr getUsersConfig();
 
@@ -1062,13 +1128,18 @@ public:
     const OpenTelemetry::TracingContext & getClientTraceContext() const { return client_info.client_trace_context; }
     OpenTelemetry::TracingContext & getClientTraceContext() { return client_info.client_trace_context; }
     void setClientTraceContext(const OpenTelemetry::TracingContext & trace_context);
-
+    // 定义表名解析时的命名空间搜索范围位掩码：
     enum StorageNamespace
     {
+        // 必须指定库名
          ResolveGlobal = 1u,                                           /// Database name must be specified
+        // 使用当前默认库
          ResolveCurrentDatabase = 2u,                                  /// Use current database
+        // 全局或当前库
          ResolveOrdinary = ResolveGlobal | ResolveCurrentDatabase,     /// If database name is not specified, use current database
+        // 尝试查找外部临时表
          ResolveExternal = 4u,                                         /// Try get external table
+        // 优先查找外部临时表，找不到再查当前库
          ResolveAll = ResolveExternal | ResolveOrdinary                /// If database name is not specified, try get external table,
                                                                        ///    if external table not found use current database.
     };
@@ -1123,7 +1194,7 @@ public:
     void addQueryAccessInfo(const Names & partition_names);
     void addViewAccessInfo(const String & view_name);
     void addUsedRowPolicy(const String & policy_name);
-
+    // 封装表标识 StorageID 和投影名称 projection_name（含 explicit operator bool() 判断是否非空），用于记录查询命中的 Projection 审计信息。
     struct QualifiedProjectionName
     {
         StorageID storage_id = StorageID::createEmpty();
@@ -1134,6 +1205,7 @@ public:
     void addQueryAccessInfo(const QualifiedProjectionName & qualified_projection_name);
 
     /// Supported factories for records in query_log
+    // 枚举需要在 system.query_log 中统计的 11 类工厂对象类型（聚合函数、组合器、数据库、数据类型、字典、格式、函数、存储引擎、表函数、可执行 UDF、SQL UDF）。
     enum class QueryLogFactories : uint8_t
     {
         AggregateFunction,

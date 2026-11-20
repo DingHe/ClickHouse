@@ -401,6 +401,7 @@ private:
     [[noreturn]] void throwUnexpectedPacket(UInt64 packet_type, const char * expected, TimeoutSetter * timeout_setter = nullptr);
 };
 
+// 典型的 C++ RAII 辅助模板类（只要类 T 实现了 setAsyncCallback(AsyncCallback) 方法即可复用）：
 template <typename Conn>
 class AsyncCallbackSetter
 {
