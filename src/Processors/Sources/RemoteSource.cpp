@@ -76,15 +76,20 @@ void RemoteSource::setStorageLimits(const std::shared_ptr<const StorageLimitsLis
 ISource::Status RemoteSource::prepare()
 {
     /// Check if query was cancelled before returning Async status. Otherwise it may lead to infinite loop.
+    // 检查当前处理器是否已被标记为取消（例如用户执行了 KILL QUERY、客户端断连或同查询其他分片抛出异常）。
     if (isCancelled())
     {
+        // 显式关闭当前 RemoteSource 的唯一输出端口（OutputPort），通知下游算子不会再有任何数据块产出。
         getPort().finish();
         return Status::Finished;
     }
-
+    // 异步查询发送的首次启动切入（仅限 Linux / macOS）
+    // async_query_sending 为 true（开启了异步发送查询）；
+    // !was_query_sent（尚未向远端节点发送查询握手包）；
 #if defined(OS_LINUX) || defined(OS_DARWIN)
     if (async_query_sending && !was_query_sent && fd < 0)
     {
+        // 向自带的 EventFD 写入一个信号，使其立即变为可读就绪状态
         startup_event_fd.write();
         return Status::Async;
     }
@@ -92,13 +97,13 @@ ISource::Status RemoteSource::prepare()
 
     if (is_async_state)
         return Status::Async;
-
+    // 查询 RemoteQueryExecutor 是否已经收到了远端分片发来的 EndOfStream 包并完成了全部读取。
     if (query_executor->isFinished())
     {
         getPort().finish();
         return Status::Finished;
     }
-
+    // 调用基类状态机与“提前结束时的连接排空”保障
     Status status = ISource::prepare();
     /// To avoid resetting the connection (because of "unfinished" query) in the
     /// RemoteQueryExecutor it should be finished explicitly.
@@ -120,18 +125,19 @@ int RemoteSource::schedule()
     return fd;
 #endif
 }
-
+// 负责处理连接排空收尾、消除异步唤醒冗余状态，以及驱动基类 ISource::work() 生产数据块。
 void RemoteSource::work()
 {
     /// Connection drain is a heavy operation that may take a long time.
     /// Therefore we move connection drain from prepare() to work(), and drain multiple connections in parallel.
     /// See issue: https://github.com/ClickHouse/ClickHouse/issues/60844
+    // 判断当前算子是否处于“需要排空连接残留数据包”的状态。
     if (need_drain)
     {
         query_executor->finish();
         return;
     }
-
+    // 设计背景：在某些异步初始化或唤醒路径中（例如连接建立或首个数据包已在前置步骤中被提前读取/预处理并存入了缓冲区或状态中），算子需要经历一次异步状态流转以更新调度器状态，但此时并不需要立即再次调用 tryGenerate() 去网络上拉取新包。
     if (preprocessed_packet)
     {
         preprocessed_packet = false;

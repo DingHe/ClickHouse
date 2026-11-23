@@ -7,17 +7,28 @@
 
 namespace DB
 {
-
+// 存储当前 Data Part 固定的虚拟列名称及其常量值（如 _part -> "all_1_1_0"）。
 using VirtualFields = std::unordered_map<String, Field>;
+// 记录各列历史平均每行字节大小的映射表，用于在反序列化变长列（如 String、Array）时预先 reserve 内存，减少动态扩容带来的内存重分配开销。
 using ValueSizeMap = std::map<std::string, double>;
 
 /// Reads the data between pairs of marks in the same part. When reading consecutive ranges, avoids unnecessary seeks.
 /// When ranges are almost consecutive, seeks are fast because they are performed inside the buffer.
 /// Avoids loading the marks file if it is not needed (e.g. when reading the whole part).
+// 定义了 ClickHouse MergeTree 存储引擎底层列式数据读取器的抽象基类 IMergeTreeReader 及其工厂函数
+// 是所有具体数据格式读取器（如宽表格式 MergeTreeReaderWide、紧凑格式 MergeTreeReaderCompact、内存格式 MergeTreeReaderInMemory、索引过滤读取器 MergeTreeReaderIndex / MergeTreeReaderTextIndex）的统一父类。
+// IMergeTreeReader 类的核心作用
+// 统一抽象不同物理存储格式的数据读取接口：向上层（MergeTreeRangeReader 和 MergeTreeReadersChain）屏蔽 Wide（每列独立 .bin/.mrk 文件）、Compact（所有列混存于单个 data.bin 文件）、InMemory 以及二级索引的物理存储差异，统一通过 readRows(...) 按 Mark（颗粒）和行数读取并反序列化列数据。
+// 连续读取与寻址（Seek）优化：在读取同一 Data Part 中相邻或接近连续的 MarkRanges 时，自动复用当前文件流位置或在内存解压缓冲区内直接步进，避免昂贵的底层文件 seek 操作和重复的 .mrk 索引加载。
+// 处理 Schema 演进（ALTER）、缺失列与默认值求值：当表结构发生变更（新增列、修改列类型、重命名列、删除列）或存在未合并的 Mutation 时，旧 Data Part 中可能缺少某些列或列类型不一致。IMergeTreeReader 负责在读取时动态填补缺失列（fillMissingColumns）、计算 DEFAULT/MATERIALIZED 默认值表达式（evaluateMissingDefaults）以及执行动态类型转换（performRequiredConversions）。
+// 管理虚拟列（Virtual Columns）与嵌套列（Nested / Subcolumns）：负责填充 _part、_part_index、_partition_id 等分区级虚拟列，并处理 Nested 类型拆分为多个子列数组时共享偏移量（Offsets）的特殊读取逻辑。
+// 支持跳数索引与远程对象存储预读（Prefetch）：
 class IMergeTreeReader : private boost::noncopyable
 {
 public:
+    // 保存每列（或子列）在流式分批反序列化过程中的上下文状态（例如前缀解析状态、多文件流状态等），支持跨多次 readRows 调用保持状态连续。
     using DeserializeBinaryBulkStateMap = std::unordered_map<std::string, ISerialization::DeserializeBinaryBulkStatePtr>;
+    // 列名/流名到对应底层压缩文件读取流 MergeTreeReaderStream 的映射表。
     using FileStreams = std::map<std::string, std::unique_ptr<MergeTreeReaderStream>>;
 
     IMergeTreeReader(
@@ -142,6 +153,7 @@ protected:
    /// Actual columns description in part.
     const ColumnsDescription & part_columns;
     /// Actual column names and types of columns in part, which may differ from table metadata.
+    // 需要读取的列和类型
     NamesAndTypes columns_to_read;
     /// Actual serialization of columns in part.
     Serializations serializations;
@@ -164,10 +176,15 @@ protected:
 
     /// Column, serialization and level (of nesting) of column
     /// which is used for reading offsets for missing nested column.
+    // 当查询请求了某个 Nested 结构中的子列（例如 nested_col.a），但该子列在当前旧 Data Part 中并不存在（新增子列），
+    // 而同属该 Nested 的另一个兄弟子列（如 nested_col.b）存在时，必须读取兄弟子列的数组偏移量（Offsets）来确定每行的数组长度，再用默认值填充 nested_col.a。
     struct ColumnForOffsets
     {
+        // 找到的可用于读取偏移量的兄弟列名称与类型。
         NameAndTypePair column;
+        // 该兄弟列的序列化器指针。
         SerializationPtr serialization;
+        // 数组嵌套层级深度。
         size_t level = 0;
     };
 

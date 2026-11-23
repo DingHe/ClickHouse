@@ -109,6 +109,9 @@ private:
     std::unordered_map<String, ISerialization::SubstreamsDeserializeStatesCache> deserialize_states_caches;
     DeserializationPrefixesCache * deserialization_prefixes_cache;
     std::unordered_set<std::string> prefetched_streams;
+    // 预取状态
+    // 上层在真正调用 readRows 之前，可能会通过 prefetchBeginOfRange 提前发起针对某个起始 Mark 的异步预读，并把目标 Mark 记在 prefetched_from_mark 中，
+    // 同时把已发起预读的流记入 prefetched_streams 避免重复预读。
     ssize_t prefetched_from_mark = -1;
     ReadBufferFromFileBase::ProfileCallback profile_callback;
     clockid_t clock_type;

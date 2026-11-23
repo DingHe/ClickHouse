@@ -531,7 +531,14 @@ void DataPartStorageOnDiskBase::backup(
         }
     }
 }
-
+// 用于将当前 Data Part 存储目录克隆/冻结到目标位置（常见于 ALTER TABLE ... FREEZE 备份快照或 DETACH 分区分离流程）
+// 返回新建的可变分区存储智能指针 MutableDataPartStoragePtr。
+// const std::string & to：目标冻结/克隆根目录的相对路径（相对于 disk 根目录，例如 shadow/<backup_name>/store/<uuid> 或 detached 所在路径前缀）。
+// const std::string & dir_path：目标分区在 to 下的子目录路径（通常为分区目录名，如 all_1_1_0）。最终克隆出的分区目录路径为 fs::path(to) / dir_path。
+// const ReadSettings & read_settings：克隆/备份读取源文件或数据时的读取参数配置。
+// const WriteSettings & write_settings：写入目标克隆文件及系统列文件时的写入参数配置。
+// std::function<void(const DiskPtr &)> save_metadata_callback：可选的元数据保存回调函数，在文件克隆完成后、清理旧/临时事务元数据文件之前执行，接收目标 DiskPtr 作为参数。
+// const ClonePartParams & params：克隆控制参数结构体
 MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
     const std::string & to,
     const std::string & dir_path,
@@ -540,12 +547,16 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
     std::function<void(const DiskPtr &)> save_metadata_callback,
     const ClonePartParams & params) const
 {
+    // 1. 获取目标磁盘与创建目标目录
+    // 从当前存储所属的 volume 获取底层磁盘 DiskPtr（disk），后续所有目录操作、备份克隆、元数据清理及新存储构造均基于此磁盘。
     auto disk = volume->getDisk();
+    // 若提供了 params.external_transaction，则在事务中调用 createDirectories(to)；否则直接通过 disk->createDirectories(to) 创建。
     if (params.external_transaction)
         params.external_transaction->createDirectories(to);
     else
         disk->createDirectories(to);
-
+    // 2. 执行分区文件克隆（硬链接或拷贝）与元数据回调
+    // 将当前 Data Part 存储（源磁盘为 disk，源相对路径为 getRelativePath()）克隆到目标路径 fs::path(to) / dir_path（目标磁盘同样为 disk）：
     Backup(
         disk,
         disk,
@@ -567,10 +578,15 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
     /// and get discarded as `Outdated`. Remove the temporary file before the main file so the cleanup
     /// is fail-closed: a failure between the two removals leaves a valid `txn_version.txt` rather than
     /// the dangerous tmp-only state.
+    // 3. 清理残留事务/销毁标记文件与写入失效系统列文件
     if (params.external_transaction)
     {
+        // 移除销毁标记文件，防止冻结/分离出来的分区在销毁时误触发源生命周期清理。
         params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / "delete-on-destroy.txt");
+        // 先移除临时事务版本文件（如 txn_version.txt.tmp）。注释明确说明原因：若只剩 .tmp 而无主文件，加载时会被视为已回滚事务进而被丢弃为 Outdated；先删 .tmp 再删主文件属于 Fail-Closed（故障安全收敛） 设计，
+        // 即使中间出错也只会留下合法的事务版本文件，不会陷入危险的仅剩 .tmp 状态。
         params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TMP_TXN_VERSION_METADATA_FILE_NAME);
+        // 移除事务版本主文件（如 txn_version.txt）。
         params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
         if (!params.keep_metadata_version)
             params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
@@ -578,6 +594,7 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
     }
     else
     {
+    // 非事务分支（else）：当没有 params.external_transaction 时，直接在 disk 上执行上述完全相同的 5 步操作（最后一步传入 *disk 作为写入目标）。
         disk->removeFileIfExists(fs::path(to) / dir_path / "delete-on-destroy.txt");
         disk->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TMP_TXN_VERSION_METADATA_FILE_NAME);
         disk->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
@@ -590,17 +607,23 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
     /// synchronously before freeze returns, so a caller that afterwards makes a destructive change
     /// (e.g. DETACH commits a covering empty part and drops the source) sees the clone already on
     /// disk. See the commit message / #111382 for the full rationale.
+    // 4. 同步刷盘冻结目录树（本地非事务场景）
+    // params.fsync_part_directory 为 true（要求同步刷盘）；
+    // !params.external_transaction（当前不在未提交的外部事务中）；
+    // !disk->isRemote()（目标磁盘不是远端对象存储磁盘）。
     if (params.fsync_part_directory && !params.external_transaction && !disk->isRemote())
         fsyncFrozenCloneTree(*disk, fs::path(to) / dir_path);
 
     /// The SingleDiskVolume and the DataPartStorageOnDiskFull built by `create` are stored on the
     /// frozen part for its whole lifetime; route them into the dedicated MergeTree arena, like the
     /// builder-owned storage path.
+    // 5. 切换 jemalloc Arena 构造新存储对象并返回
     ScopedJemallocThreadArena mergetree_arena_scope(JemallocMergeTreeArena::getArenaIndex());
     auto single_disk_volume = std::make_shared<SingleDiskVolume>(disk->getName(), disk, 0);
 
     /// Do not initialize storage in case of DETACH because part may be broken.
     bool to_detached = dir_path.starts_with(std::string_view((fs::path(MergeTreeData::DETACHED_DIR_NAME) / "").string()));
+    // 实例化冻结/克隆后的分区存储对象：
     auto frozen_storage = create(single_disk_volume, to, dir_path, /*initialize=*/ !to_detached && !params.external_transaction);
 
     return frozen_storage;
@@ -1131,19 +1154,26 @@ bool DataPartStorageOnDiskBase::isCaseInsensitive() const
 {
     return getDisk()->isCaseInsensitive();
 }
-
+// 盘分区存储基类中用于快速判断并获取 skp_idx.packed（打包跳数索引归档）读取器的受保护（protected）虚方法。
+// const std::string & name：请求查询或读取的分区内逻辑文件名（例如 "user_id.bin"、"checksums.txt"，或二级跳数索引子流文件名 "skp_idx_my_idx.idx2"）。
 std::shared_ptr<const PackedFilesReader> DataPartStorageOnDiskBase::getArchiveReaderForFile(const std::string & name) const
 {
     /// Prefix gate: only "skp_idx_..." names can be archive members, so unrelated files never load
     /// or probe skp_idx.packed.
+    // 在触碰磁盘、缓存或互斥锁之前，先在纯内存中进行一次极低开销的字符串前缀检查（判断 name 是否符合跳数索引文件的命名规范，即以 "skp_idx_" 开头）。
+    // 核心设计动机（性能与隔离性优化）：
+    // 避免多余的元数据 I/O：一个分区读取过程中会高频查询大量普通文件（如 checksums.txt、columns.txt、primary.idx 以及几十上百个列 .bin/.mrk2 文件）。在 S3/HDFS 等远程对象存储或 ZooKeeper/Keeper 磁盘上，
+    // 探测 skp_idx.packed 是否存在会产生额外的网络元数据请求。通过这行前缀门控，所有普通文件在内存中直接短路返回 nullptr，完全不会触发对 skp_idx.packed 的探测或加载。
     if (!looksLikePackedSkipIndexFile(name))
         return nullptr;
     auto reader = getSkipIndicesPackedReader();
+    // 3. 校验目标文件是否真实存在于归档目录中
     return (reader && reader->exists(name)) ? reader : nullptr;
 }
-
+// const std::string & name 待查询的逻辑文件名（相对于当前 Data Part 存储目录的相对路径，例如某列的 .bin、.mrk2 数据/标记文件，或分区元信息文件）。
 bool DataPartStorageOnDiskBase::existsFile(const std::string & name) const
 {
+    // 查询当前 Data Part 是否存在包含逻辑文件 name 的归档读取器（如将多个小文件合并打包后的归档索引）。
     if (getArchiveReaderForFile(name))
         return true;
     return existsFileImpl(name);
@@ -1155,21 +1185,32 @@ size_t DataPartStorageOnDiskBase::getFileSize(const std::string & file_name) con
         return reader->getFileSize(file_name);
     return getFileSizeImpl(file_name);
 }
-
+// 磁盘型分区存储（包括 Full 和 Packed 两种存储布局）构建底层文件读取管道（ReadPipeline）的统一入口方法
+// 核心职责是实现“打包跳数索引覆盖层（skp_idx.packed Overlay）”的透明分流：优先检查目标文件是否位于分区级的跳数索引归档包内，若命中则构建归档切片读取源；否则下沉交给具体子类的 prepareReadImpl 处理常规列文件。
 void DataPartStorageOnDiskBase::prepareRead(
+    // 请求读取的分区内逻辑文件名（例如 "user_id.bin"、"checksums.txt"，或者二级跳数索引子流文件名 "skp_idx_my_idx.idx2"）。
     const std::string & name,
+    // 读取配置参数集合，包含缓冲区大小、是否启用本地文件系统缓存、异步预读配置、IO 优先级及校验和选项等。
     const ReadSettings & settings,
+    // 读取大小提示（可选值）。
+    // 在 MergeTreeReaderWide 等场景下，通常传入从 .mrk 索引算出的目标读取区间长度，帮助底层缓冲区精确分配内存或发起指定字节范围（Range）的远程对象存储请求
     std::optional<size_t> read_hint,
     ReadPipeline & pipeline) const
 {
+    // 1. 打包跳数索引归档（skp_idx.packed）探测与拦截
+    // 调用受保护的虚方法 getArchiveReaderForFile(name) 检查 name 是否是存储在 skp_idx.packed 归档文件中的虚拟跳数索引文件。
     if (auto reader = getArchiveReaderForFile(name))
     {
         /// Members of skp_idx.packed skip the disk's normal pipeline (filesystem cache, async
         /// prefetch) and read through PackedFilesReader::readFile, which opens the archive via the
         /// underlying disk and wraps the result with ReadBufferFromFileView at the right offset.
         /// The archive's current location is captured here, so the reader holds no path of its own.
+        // 2. 命中归档后的路径快照与读取源构造
+        // 获取当前分区所在的底层 IDisk 智能指针（本地磁盘或远程 S3/HDFS 磁盘）。
         auto disk = volume->getDisk();
+        // 动态拼接出当前 skp_idx.packed 归档文件在 disk 上的完整相对路径（例如 "database/table/all_1_1_0/skp_idx.packed"）。
         String archive_path = fs::path(root_path) / part_dir / String(SKIP_INDICES_PACKED_FILENAME);
+        // 3. 组装 ReadPipeline::BufferCreator 工厂闭包并设为管道数据源
         ReadPipeline::BufferCreator creator =
             [reader, disk, archive_path, name, read_hint](const StoredObject &, const ReadSettings & s, bool, bool)
             {
@@ -1193,17 +1234,23 @@ std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskBase::readFileIfExi
             name, settings, read_hint);
     return readFileIfExistsImpl(name, settings, read_hint);
 }
-
+// 磁盘分区存储基类中用于线程安全地懒加载（Lazy Load）并缓存分区级打包跳数索引归档（skp_idx.packed）读取器的受保护虚方法。
 std::shared_ptr<const PackedFilesReader> DataPartStorageOnDiskBase::getSkipIndicesPackedReader() const
 {
+    // 加互斥锁，确保同一时刻只有一个线程执行磁盘探测与 skp_idx.packed 归档头部解析，其余并发查询线程在此等待结果。
     std::lock_guard lock(skip_indices_packed_mutex);
+    // 正向缓存命中：若 probed == true 且 reader != nullptr，直接返回已解析好的归档读取器。
     if (skip_indices_packed_probed)
         return skip_indices_packed_reader;
-
+    // 在当前线程上下文中设置 ZooKeeper/Keeper 协调组件标签（RAII 守卫，函数退出时自动恢复）
+    // 当底层 disk 是带有 Keeper 元数据映射的远程对象存储（如 DiskObjectStorage）时，该标签用于追踪并统计是哪个模块发起了元数据查询。
     auto component_guard = Coordination::setCurrentComponent("DataPartStorageOnDiskBase::getSkipIndicesPackedReader");
-
+    // 实时拼接出当前分区目录下 skp_idx.packed 文件的相对路径（例如 "database/table/all_1_1_0/skp_idx.packed"）。
+    // 之所以每次动态拼接而非缓存固定路径，是因为分区在构建期间会经历 rename 移动。
     const String packed_path = fs::path(root_path) / part_dir / String(SKIP_INDICES_PACKED_FILENAME);
+    // 获取当前分区所属存储卷对应的底层 IDisk 智能指针。
     auto disk = volume->getDisk();
+    // 3. 探测文件存在性并处理并发竞态（TOCTOU 防护）
     if (disk->existsFile(packed_path))
     {
         /// On shared storage another replica may delete or relocate skp_idx.packed between the
@@ -1218,6 +1265,7 @@ std::shared_ptr<const PackedFilesReader> DataPartStorageOnDiskBase::getSkipIndic
         Expect404ResponseScope scope;
         try
         {
+            // 构造 PackedFilesReader，它会打开 packed_path 文件并读取归档末尾的索引目录表（记录每个虚拟跳数索引子流的偏移量和大小）。
             skip_indices_packed_reader = std::make_shared<PackedFilesReader>(disk, packed_path, ReadSettings{});
         }
         catch (const Exception &)
@@ -1227,7 +1275,7 @@ std::shared_ptr<const PackedFilesReader> DataPartStorageOnDiskBase::getSkipIndic
             return nullptr;
         }
     }
-
+    // 4. 标记探测完成并返回结果
     skip_indices_packed_probed = true;
     return skip_indices_packed_reader;
 }

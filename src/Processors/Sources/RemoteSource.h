@@ -12,16 +12,13 @@
 namespace DB
 {
 
-// 该文件定义了与远程节点（分片或副本）进行网络通信并拉取查询结果的核心数据源体系
-// RemoteSource（远程主数据源）
-// 网络数据拉取桥梁：继承自 ISource，内部封装了 RemoteQueryExecutor，负责向远程 ClickHouse 节点发送查询请求并流式接收返回的数据包，将其转化为本地执行流水线中的 Chunk。
-// 全异步非阻塞 I/O 支持：支持异步发送查询（async_query_sending）与异步读取网络数据（async_read）。通过重写 schedule() 和 onAsyncJobReady()，将底层网络 Socket 的文件描述符（fd）注册到流水线调度器的事件循环（如 epoll/kqueue）中，避免网络等待阻塞工作线程。
-// 分布式聚合状态与统计透传：支持将远程节点发来的两阶段聚合元数据（如分桶号 bucket_num）封装为 AggregatedChunkInfo 挂载到 Chunk 上，并能接收远程节点统计的 rows_before_limit 等信息。
-
 class RemoteQueryExecutor;
 using RemoteQueryExecutorPtr = std::shared_ptr<RemoteQueryExecutor>;
 
 /// Source from RemoteQueryExecutor. Executes remote query and returns query result chunks.
+// 流水线与网络层的适配器：
+// 将 RemoteQueryExecutor 从远端分片拉取到的 Block 转换为流水线标准的 Chunk，并在需要时附加两阶段聚合的桶信息（AggregatedChunkInfo）。
+// 同步与异步双模调度枢纽：深度集成 ClickHouse 流水线调度器的异步状态机（Status::Async、schedule()、onAsyncJobReady()）,当开启 async_read 或 async_query_sending 时，它能在网络遇到 EAGAIN 阻塞时主动向调度器返回文件描述符（fd）并让出工作线程，待 epoll/kqueue 事件就绪后再恢复执行。
 class RemoteSource final : public ISource
 {
 public:
@@ -72,6 +69,7 @@ private:
 };
 
 /// Totals source from RemoteQueryExecutor.
+// 专用于从 RemoteQueryExecutor 中提取远端节点返回的 WITH TOTALS 汇总数据块（Totals），输出到流水线的 Totals 专用端口。
 class RemoteTotalsSource final : public ISource
 {
 public:
@@ -88,6 +86,8 @@ private:
 };
 
 /// Extremes source from RemoteQueryExecutor.
+// 极值行源算子
+// 专用于从 RemoteQueryExecutor 中提取远端节点返回的极值数据块（Extremes，最小/最大值），输出到流水线的 Extremes 专用端口。
 class RemoteExtremesSource final : public ISource
 {
 public:
@@ -102,7 +102,7 @@ protected:
 private:
     RemoteQueryExecutorPtr query_executor;
 };
-
+// 并行数据块反序列化算子
 struct UnmarshallBlocksTransform : ISimpleTransform
 {
 public:
@@ -117,6 +117,7 @@ public:
 };
 
 /// Create pipe with remote sources.
+// 远程数据源管道工厂函数
 Pipe createRemoteSourcePipe(
     RemoteQueryExecutorPtr query_executor,
     bool add_aggregation_info,

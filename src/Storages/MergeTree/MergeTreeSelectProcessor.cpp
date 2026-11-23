@@ -391,20 +391,26 @@ ChunkAndProgress MergeTreeSelectProcessor::buildVirtualRowFromIndex(
 
     return {std::move(chunk), 0, 0, false, {}};
 }
-
+// ClickHouse 从 MergeTree 存储引擎流式读取数据的主驱动循环。它不仅串联了任务分配（getNewTask）、实际读取（readCurrentTask），还集成了查询条件缓存（QueryConditionCache）回写和虚拟行（Virtual Row）推进等高级优化机制。
 ChunkAndProgress MergeTreeSelectProcessor::read()
 {
+    // 1. 优先输出待发送的虚拟行（Virtual Row）
+    // 如果上一轮读取数据块后生成了用于归并排序推进的“虚拟行”（存储在 std::optional<ChunkAndProgress> pending_virtual_row 中），
+    // 本轮优先将其取出、清空缓存并直接返回给下游算子（如 MergingSortedTransform）。
     if (pending_virtual_row)
     {
         auto result = std::move(*pending_virtual_row);
         pending_virtual_row.reset();
         return result;
     }
-
+    // 2. 读取主循环与取消检查
     while (!is_cancelled)
     {
         try
         {
+            // 只要查询未被取消，就持续尝试获取任务并读取数据块。
+            // !task：首次进入 read()，尚未领取任何读取任务。
+            // algorithm->needNewTask(*task)：当前任务中的 mark_ranges 已经被当前读取算法（如多线程随机读或顺序读算法）消耗完毕，需要申请下一批范围或切换到下一个 Data Part。
             if (!task || algorithm->needNewTask(*task))
             {
                 /// Update the query condition cache for filters in PREWHERE stage.
@@ -415,6 +421,14 @@ ChunkAndProgress MergeTreeSelectProcessor::read()
                 /// A row-level security filter is also prepended before PREWHERE, yet this write keys
                 /// only on the query PREWHERE hash, so a mark hidden by a row policy must not be attributed
                 /// to the PREWHERE predicate (a later query without the policy would skip rows it should see).
+                // 3. 写入查询条件缓存（QueryConditionCache）
+                // 当旧任务刚刚完成、准备切换新任务时，如果满足严格的无前置过滤污染条件，将本次 PREWHERE 过滤后命中的未匹配 Mark 位图写入全局 QueryConditionCache，供后续相同条件的查询直接跳过整块 Granule：
+                // reader_settings.use_query_condition_cache：当前查询开启了条件缓存功能。
+                // task && prewhere_info：存在刚执行完的任务，且查询包含 PREWHERE 过滤条件。
+                // !task->readersChainCanSkipMarksBeforePrewhere()：链条前置环节（如二级跳数索引 Skip-Index 或投影索引 Projection-Index）没有提前跳过 Mark。否则会把索引跳过的 Mark 误记为 PREWHERE 条件不匹配（Issue #104781）。
+                // !task->appliesMutationsBeforePrewhere()：没有在 PREWHERE 之前执行轻量级更新/删除（On-fly mutations 或 Patch parts），避免行变更导致过滤结果与原始 Part 不一致。
+                // !row_level_filter：未启用行级安全策略（Row-Level Security）。因为缓存 Key 仅绑定查询自身的 PREWHERE 哈希，若写入了某用户行级策略隐藏的 Mark，后续没有该策略的高权限用户查询时会错误跳过本该看到的数据。
+                // task->getInfo().data_part_info->getDataPart()：必须是本地具体存在的实体 Data Part（拥有明确的 StorageID::uuid），跳过并行副本读取中借用（Borrowed）的远程虚拟 Part。
                 if (reader_settings.use_query_condition_cache && task && prewhere_info
                     && !task->readersChainCanSkipMarksBeforePrewhere()
                     && !task->appliesMutationsBeforePrewhere()
@@ -422,19 +436,23 @@ ChunkAndProgress MergeTreeSelectProcessor::read()
                     /// QueryConditionCache needs the concrete part's storage UUID; skip for borrowed parts.
                     && task->getInfo().data_part_info->getDataPart())
                 {
+                    // 提取过滤表达式并落盘缓存：
                     for (const auto * output : prewhere_info->prewhere_actions.getOutputs())
                     {
+                        // 遍历 prewhere_actions 的输出节点，找到对应过滤列 prewhere_column_name 的 DAG 节点。
                         if (output->result_name == prewhere_info->prewhere_column_name)
                         {
+                            // 如果过滤条件包含非确定性函数（如 now()、rand()），绝对不能缓存，直接跳过。
                             if (!VirtualColumnUtils::isDeterministic(output))
                                 continue;
 
                             auto query_condition_cache = Context::getGlobalContextInstance()->getQueryConditionCache();
                             const auto & data_part_info = task->getInfo().data_part_info;
-
+                            // 构造 part_name：如果是投影（Projection）分区，格式化为 "父分区名:投影名"；否则直接取普通分区名。
                             String part_name = data_part_info->isProjectionPart()
                                 ? fmt::format("{}:{}", data_part_info->getParentPartName(), data_part_info->getPartName())
                                 : data_part_info->getPartName();
+                            // 将表 UUID、分区名、过滤表达式 AST 哈希（output->getHash()）、条件列名、本次记录的未匹配 Mark 位图（getPrewhereUnmatchedMarks()）以及总 Mark 数写入全局条件缓存。
                             query_condition_cache->write(
                                 /// QueryConditionCache is a coordinator feature; concrete part present here.
                                 data_part_info->getDataPart()->storage.getStorageID().uuid,
@@ -449,14 +467,16 @@ ChunkAndProgress MergeTreeSelectProcessor::read()
                         }
                     }
                 }
-
+                // 4. 获取新任务 & 记录 StorageID
+                // 向读取池 pool 申请下一个读取任务（传入旧 task.get() 以便在同一个 Part 内复用底层的列文件读取器）。
                 task = algorithm->getNewTask(*pool, task.get());
             }
-
+            // 如果返回空指针，说明读取池中的所有 Data Part 和 Mark 范围均已分配并读取完毕，跳出 while 循环结束流。
             if (!task)
                 break;
 
             /// QueryConditionCache needs the concrete part's storage id; skip for borrowed parts.
+            // 首次拿到有效实体 Part 时，缓存其 StorageID（供后续查询条件缓存命中查询使用）以及当前任务中前置 mutation 步骤的数量偏移量。
             if (storage_id.empty() && task->getInfo().data_part_info->getDataPart())
             {
                 storage_id = task->getInfo().data_part_info->getDataPart()->storage.getStorageID();
@@ -469,16 +489,19 @@ ChunkAndProgress MergeTreeSelectProcessor::read()
                 break;
             throw;
         }
-
+        // 6. 执行当前任务读取 & 生成下一个虚拟行
         auto result = readCurrentTask(*task, *algorithm);
 
         /// Emit a virtual row update after each block, carrying the next mark's PK boundary.
         /// This allows MergingSortedTransform to reprioritize sources when:
         /// - PREWHERE filters all rows (merge gets updated position without actual data)
         /// - A downstream filter (WHERE, JOIN) removes all rows (virtual row passes through filters)
+        // 如果启用了 virtual_row_conversions（用于有序归并优化）且当前流尚未结束（!result.is_finished）
         if (virtual_row_conversions && !result.is_finished)
         {
+            // 根据刚读完的 read_mark_ranges 从主键索引（Primary Index）中提取下一个 Mark 的主键值，构造一个仅含边界信息的虚拟行 vrow。
             auto vrow = buildVirtualRowFromIndex(*task, result.read_mark_ranges);
+            // 将 vrow 存入 pending_virtual_row，这样下一次进入 read() 时（函数最开头的 if (pending_virtual_row) 分支）就会紧随本次数据块之后将其发送出去。
             if (vrow.chunk)
                 pending_virtual_row.emplace(std::move(vrow));
         }

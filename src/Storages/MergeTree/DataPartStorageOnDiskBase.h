@@ -13,7 +13,13 @@ namespace DB
 class IVolume;
 using VolumePtr = std::shared_ptr<IVolume>;
 class PackedFilesWriter;
-
+// 定义了 ClickHouse MergeTree 存储引擎中所有基于磁盘（IDisk / IVolume）的分区存储实现的抽象中间基类
+// 统一封装基于 IVolume / IDisk 的通用物理文件与目录生命周期
+// 实现了路径拼装（全路径、相对路径、父目录）、磁盘状态查询（本地盘 vs 远程对象存储、缓存名称、空间预留 reserve）、分区目录创建、原子重命名（rename）、安全清理（remove）、备份（backup）以及分区克隆/冻结（freeze、freezeRemote、clonePart）等所有磁盘存储共有的核心基础设施。
+// 统一事务执行分发器：
+// 持有 DiskTransactionPtr transaction，通过模板辅助方法 executeWriteOperation 将写操作透明路由到活跃的磁盘事务（用于对象存储批量原子提交）或直接提交给底层 IDisk。
+// 提供透明的打包跳数索引覆盖层（skp_idx.packed Overlay）：
+// 为了减少二级跳数索引（Skip Indices）在磁盘上产生过多小文件，ClickHouse 支持将多个 skp_idx_* 文件合并打包进 skp_idx.packed 归档中。
 class DataPartStorageOnDiskBase : public IDataPartStorage
 {
 public:
@@ -59,6 +65,8 @@ public:
     /// serves the substreams instead. Keeps the archive out of the read pipeline and the callers.
     bool existsFile(const std::string & name) const final;
     size_t getFileSize(const std::string & file_name) const final;
+    // 构建读取管道（ReadPipeline）的核心入口。prepareRead 先通过 getArchiveReaderForFile 判断是否为 skp_idx.packed 内的虚拟索引流；
+    // 若是则直接添加偏移切片读取阶段，否则下沉调用子类的 prepareReadImpl（Full 模式打开独立文件，Packed 模式切片读取 data.packed）。
     void prepareRead(
         const std::string & name,
         const ReadSettings & settings,
@@ -233,17 +241,25 @@ public:
     /// no packed archive. See the seed rationale above.
     void seedSkipIndicesPackedReaderFrom(const IDataPartStorage & source) const;
 protected:
-
+    // 指向存储卷（IVolume）的共享指针，通过 volume->getDisk() 获取当前分区所在的底层 IDisk 实例（本地磁盘或 S3/HDFS 磁盘）。
     VolumePtr volume;
+    // 分区所在父目录相对于磁盘挂载根的路径（例如 "database/table" 或 "database/table/moving"）。
     std::string root_path;
+    // 当前分区自身的目录名称（例如 "all_1_5_1"）。root_path 与 part_dir 拼接即构成完整的分区相对路径。
     std::string part_dir;
+    // 底层磁盘事务指针（在 S3/Keeper 磁盘模式下用于收集批量元数据修改操作，实现原子提交；普通本地盘模式下通常为空）。
     DiskTransactionPtr transaction;
+    // 标识当前存储实例的 transaction 是否是从外部父分区（如创建 Projection 子分区时传入 use_parent_transaction = true）共享借用的。若为 true，子分区不应独自提交或回滚该共享事务。
     bool has_shared_transaction = false;
 
     /// Cached probe state for skp_idx.packed. probed=false means we haven't checked the disk yet;
     /// probed=true with reader=null means we checked and the archive isn't present.
+    // 互斥锁，用于保护多线程并发探测和懒加载 skp_idx.packed 归档索引时的状态一致性。
     mutable std::mutex skip_indices_packed_mutex;
+    // 懒加载探测标志位（受 skip_indices_packed_mutex 保护）。false 表示尚未检查磁盘是否存在 skp_idx.packed；
+    // true 表示已探测过（配合 skip_indices_packed_reader == nullptr 可缓存“文件不存在”的负向结果，避免反复访问磁盘/S3 探测）。
     mutable bool skip_indices_packed_probed TSA_GUARDED_BY(skip_indices_packed_mutex) = false;
+    // 缓存的 skp_idx.packed 归档索引读取器共享指针（受 skip_indices_packed_mutex 保护），保存归档内所有跳数索引虚拟文件的 (offset, size) 目录表。
     mutable std::shared_ptr<const PackedFilesReader> skip_indices_packed_reader TSA_GUARDED_BY(skip_indices_packed_mutex);
 
     template <typename Op>
@@ -273,7 +289,9 @@ private:
     /// members for Packed storage), without the skp_idx.packed overlay. The `final`
     /// existsFile/getFileSize/prepareRead/readFileIfExists add the overlay and delegate here.
     virtual bool existsFileImpl(const std::string & name) const = 0;
+
     virtual size_t getFileSizeImpl(const std::string & file_name) const = 0;
+    // 如果 name 不是 skp_idx.packed 中的成员（例如所有普通数据列 .bin、Mark 文件 .mrk2、主索引 primary.idx 以及独立存储的跳数索引），则调用纯虚钩子 prepareReadImpl(...) 交由具体子类处理
     virtual void prepareReadImpl(
         const std::string & name,
         const ReadSettings & settings,

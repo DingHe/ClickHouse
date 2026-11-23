@@ -24,25 +24,27 @@ PackedFilesReader::PackedFilesReader(PackedFilesIO::Index index_)
 {
 }
 
-
+// ReadBuffer & in 指向归档/打包文件索引区段的二进制输入缓冲区引用
 PackedFilesIO::Index PackedFilesReader::readIndex(ReadBuffer & in)
 {
+    // 1. 读取并校验索引格式版本号
     UInt8 version = 0;
     readIntBinary(version, in);
-
+    // 检查 version 是否超过当前二进制支持的最大版本上限 PackedFilesIO::MAX_VERSION。
     if (version > PackedFilesIO::MAX_VERSION)
         throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
             "Unknown format ({}) of packed data", std::to_string(version));
 
     PackedFilesIO::Index index;
     size_t num_files = 0;
+    // 2. 读取归档内文件条目总数并初始化索引映射
     readIntBinary(num_files, in);
-
+    // 3. 循环反序列化每个文件的偏移描述并去重校验
     for (size_t i = 0; i < num_files; ++i)
     {
         String file_name;
         PackedFilesIO::FileOffset offset{};
-
+        // 读取变长二进制字符串（长度前缀 + 字节内容），得到归档内逻辑文件名；
         readStringBinary(file_name, in);
         readIntBinary(offset.offset, in);
         readIntBinary(offset.size, in);
@@ -52,6 +54,7 @@ PackedFilesIO::Index PackedFilesReader::readIndex(ReadBuffer & in)
         if (!index.emplace(file_name, offset).second)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "Duplicated file: {}", file_name);
     }
+    // 读取变长二进制字符串（长度前缀 + 字节内容），得到归档内逻辑文件名；
     return index;
 }
 

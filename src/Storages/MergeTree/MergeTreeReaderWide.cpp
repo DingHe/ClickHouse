@@ -103,7 +103,20 @@ void MergeTreeReaderWide::prefetchBeginOfRange(Priority priority)
         throw;
     }
 }
-
+// ClickHouse 宽表读取器（MergeTreeReaderWide）在真正逐列反序列化数据之前，批量向底层文件系统发起异步预读（Prefetch）请求的核心方法。
+// 在宽表格式（Wide Part）中，每一列都有独立的 .bin 数据文件。如果串行读取 50 列，每读一列都要等待一次磁盘或远程对象存储（如 S3/HDFS）的 I/O 往返延迟。
+// 该方法通过提前遍历所有待读取列并下发异步预取指令，让底层 I/O 线程池能够并行加载所有列的数据块。
+// Priority priority：I/O 调度优先级（封装了读取任务的优先级数值）。底层异步读取线程池（如 AsynchronousReadBufferFromRemoteFS）会根据该优先级来调度不同查询或后台合并任务的预读请求顺序。
+// size_t num_columns：需要预读的列总数（通常等于 columns_to_read.size()）。
+// size_t from_mark：计划开始读取的起始 Mark（颗粒 Granule）索引编号，用于定位每列 .bin 文件中的读取偏移量。
+// bool continue_reading：是否紧接上一次读取结束的位置继续向后读取：
+// bool deserialize_prefixes：布尔开关，指示在预取各列主体数据流之前，是否先预取并反序列化复杂类型的公共头部前缀（如 LowCardinality 的字典流、Tuple/Nested 的外层结构前缀）
+// Mark（标记） 是连接稀疏主键索引（primary.idx）与底层列压缩数据文件（.bin）之间的地址定位指针。
+// ClickHouse 的数据按主键排序后，每间隔 index_granularity 行（默认 8192 行）划分为一个逻辑数据颗粒，称为 Granule。为了节省内存，稀疏主索引 primary.idx 只记录每个 Granule 起始行的主键值，并不直接存储磁盘文件字节偏移量。
+// 原因在于：
+// 列式独立压缩：在 Wide 格式下，每一列单独存为一个 .bin 文件，且 .bin 文件由多个变长的压缩块（Compressed Block，默认约 64KB～1MB）拼接而成。不同列的数据压缩率不同，无法通过行号直接推算出磁盘位置。
+// 解耦索引与物理存储：通过引入独立的 Mark 文件（.mrk / .mrk2 / .mrk3），主索引只需要给出目标颗粒的编号（即 mark_number，第几个 Granule），再由 Mark 文件将其翻译为物理磁盘坐标。
+// 在典型的宽表（Wide Part）下，每个列都有自己对应的 .mrk2 文件（如 user_id.mrk2）。文件由一条条固定长度的 Mark 记录顺序排列而成，第 $i$ 条 Mark 记录对应第 $i$ 个 Granule 的起始位置。
 void MergeTreeReaderWide::prefetchForAllColumns(
     Priority priority,
     size_t num_columns,
@@ -111,28 +124,39 @@ void MergeTreeReaderWide::prefetchForAllColumns(
     bool continue_reading,
     bool deserialize_prefixes)
 {
+    // 1. 判断当前存储介质是否启用预读
+    // 根据当前 Data Part 所在的存储介质类型（远程对象存储 vs 本地磁盘），从读取配置 settings.read_settings 中选择对应的预读开关：
     bool do_prefetch = data_part_info_for_read->getDataPartStorage()->isStoredOnRemoteDisk()
         ? settings.read_settings.remote_fs_settings.prefetch
         : settings.read_settings.local_fs_settings.prefetch;
-
+    // 2. 准入条件检查与并发预读数量限制
+    // 开关与空范围检查：如果对应存储介质未开启预读（!do_prefetch），或者当前分配到的总待读 Mark 数为 0（无数据可读），直接 return 跳过。
     if (!do_prefetch || all_mark_ranges.getNumberOfMarks() == 0)
         return;
+    // 如果配置了单次最大并发文件系统预读数限制（settings.filesystem_prefetches_limit > 0），且当前查询涉及的列数 num_columns 超过了该阈值（例如一张宽表有上千列 SELECT *），则放弃批量预读直接 return。
+    // 设计动机：同时为上千列创建异步读取缓冲区并向 S3/内核发起上千个并发请求，会导致内存瞬间暴涨或打满远程存储连接池；超过阈值时退化为按需同步读取更稳妥。
     if (settings.filesystem_prefetches_limit && num_columns > settings.filesystem_prefetches_limit)
         return;
-
+    // 当 deserialize_prefixes 为 true 时，先对所有包含公共前缀的复杂列（例如同一 Nested 或 Tuple 下的多个子列、带有共享字典的 LowCardinality 列）发起前缀流的预取并完成前缀反序列化。
     if (deserialize_prefixes)
         deserializePrefixForAllColumnsWithPrefetch(num_columns, from_mark, priority);
 
     /// Request reading of data in advance,
     /// so if reading can be asynchronous, it will also be performed in parallel for all columns.
+    // 4. 遍历所有列发起并行异步预读
     for (size_t pos = 0; pos < num_columns; ++pos)
     {
+        // 过滤无效列：如果第 pos 列已被未合并的 DROP COLUMN Mutation 删除（isColumnDroppedByPendingMutation(pos)），或该系统列已失效（isSystemColumnInvalidated(pos)），
+        // 说明后续 readRows 根本不会去读它的磁盘文件，因此直接 continue 跳过，避免浪费多余的磁盘 I/O。
         if (isColumnDroppedByPendingMutation(pos) || isSystemColumnInvalidated(pos))
             continue;
 
         try
         {
             auto & cache = caches[columns_to_read[pos].getNameInStorage()];
+            // 调用单列预读
+            // 根据该列的序列化器 serializations[pos] 遍历其关联的所有底层文件流（例如普通列只有 .bin 流；Nullable 有 .null.bin 和 .bin 两个流；Array 有 .size0.bin 和 .bin 两个流），定位到 from_mark 对应的压缩块偏移量，
+            // 并向底层 ReadBuffer 发送异步预读指令（将任务提交给 I/O 线程池后台加载，当前线程不阻塞等待数据就绪，立刻继续循环下一列）
             prefetchForColumn(
                 priority, columns_to_read[pos], serializations[pos], from_mark, continue_reading, cache);
         }
@@ -144,51 +168,71 @@ void MergeTreeReaderWide::prefetchForAllColumns(
         }
     }
 }
-
+// ClickHouse 宽表格式（Wide Part，即每一列单独存储为一个 .bin 数据文件和 .mrk/.mrk2 索引文件）的核心数据读取实现。
+// 负责按颗粒（Granule/Mark）和行数，并发预读、反序列化多列数据，并处理列缺失、缓存复用以及损坏分区诊断。
+// size_t from_mark：起始读取的 Mark（数据颗粒 Granule）索引编号。当需要重新寻址（Seek）时，读取器根据该编号从 .mrk 文件中查找对应列在 .bin 文件中的压缩块偏移量与解压后偏移量。
+// bool continue_reading：是否紧接上一次读取结束的位置继续向后读取： true：忽略 from_mark 的 seek 操作，直接从当前流缓冲区指针继续往后顺序读（消除连续范围读取时的冗余寻址开销）。false：主动执行 seek 定位到 from_mark 处开始读取（通常在首次读取或跳过了不连续的 Mark 区间时触发）。
+// size_t max_rows_to_read：本次调用允许读取的最大行数上限（由上层 MergeTreeRangeReader 结合 Granule 边界和期望块大小计算得出）。
+// MutableColumns & res_columns：输出列容器数组（std::vector<MutableColumnPtr> 的引用），长度与 columns_to_read 一一对应。读取到的数据会直接追加（Append）到对应位置的列对象末尾；若元素为 nullptr，方法内部会自动创建新列；若某列在当前 Part 中缺失或已被删除，对应位置会被置为 nullptr 交由后续 fillMissingColumns 补全
+// 返回值 size_t：本次实际读取到的行数。
 size_t MergeTreeReaderWide::readRows(
     size_t from_mark, bool continue_reading, size_t max_rows_to_read,
     MutableColumns & res_columns)
 {
+    // 1. 初始化与校验预取缓存有效性
+    // 记录本批次中所有列读取到的最大行数。
     size_t read_rows = 0;
+    // 预取状态检查
     if (prefetched_from_mark != -1 && static_cast<size_t>(prefetched_from_mark) != from_mark)
     {
         prefetched_streams.clear();
         prefetched_from_mark = -1;
     }
-
+    // 2. 列数校验与零列快速路径
     try
     {
         size_t num_columns = res_columns.size();
+        // 校验传入的 res_columns 数组长度是否与 columns_to_read 的大小严格一致，不一致则抛出逻辑异常。
         checkNumberOfColumns(num_columns);
-
+        // 当查询只需要虚拟列（如 SELECT _part FROM table）或纯计数（如 SELECT count() FROM table 且无过滤条件）时，
+        // 不需要从磁盘读取任何物理列，num_columns 为 0。此时直接返回 max_rows_to_read，跳过一切磁盘 I/O。
         if (num_columns == 0)
             return max_rows_to_read;
-
+        // 3. 批量异步预读与公共前缀反序列化
+        // 在逐列解码之前，一次性遍历所有待读取列，向底层 MergeTreeReaderStream（尤其是 S3/HDFS 等远程对象存储或异步本地文件读取器）发起批量异步预读（Prefetch）请求，
+        // 使多列 I/O 能够并发重叠执行，而不是串行等待每一列的磁盘响应。
         prefetchForAllColumns(Priority{}, num_columns, from_mark, continue_reading, /*deserialize_prefixes=*/ true);
+        // 针对复杂类型或子列（如 Array、Tuple、Map、Nullable、LowCardinality），
+        // 在读取主体数据前统一反序列化它们的公共头部前缀（例如 LowCardinality 的字典流或嵌套类型的外层结构前缀），确保后续读取子列时状态就绪。
         deserializePrefixForAllColumns(num_columns, from_mark);
 
         for (size_t pos = 0; pos < num_columns; ++pos)
         {
+            // 跳过已删除或失效的列：
             if (isColumnDroppedByPendingMutation(pos) || isSystemColumnInvalidated(pos))
             {
                 res_columns[pos] = nullptr;
                 continue;
             }
-
+            // 获取/创建输出列容器
             const auto & column_to_read = columns_to_read[pos];
 
             /// The column may already be present (we append the values to the end) or empty; either way it is
             /// uniquely owned here, so we read into it directly without cloning.
+            // 如果 res_columns[pos] 为空（首轮读取），调用数据类型和序列化器的 createColumn 创建一个新的空可变列对象
             auto & column = res_columns[pos];
             if (!column)
                 column = column_to_read.type->createColumn(*serializations[pos]);
 
             try
             {
+                // 记录读取前该列已有的行数
                 size_t column_size_before_reading = column->size();
+                // 当同一张表同时读取同一个父列的多个子列（例如读取 tuple_col.a 和 tuple_col.b，或 nested_col.x 和 nested_col.y）时，
+                // 第一个子列读取共享数据流（如 offsets 或父 Tuple）后会存入这两个缓存中，第二个子列直接从内存缓存复用，避免对同一底层文件流重复读取与反序列化。
                 auto & cache = caches[column_to_read.getNameInStorage()];
                 auto & deserialize_states_cache = deserialize_states_caches[column_to_read.getNameInStorage()];
-
+                // 核心单列读取函数
                 readData(
                     column_to_read,
                     serializations[pos],
@@ -201,6 +245,7 @@ size_t MergeTreeReaderWide::readRows(
 
                 /// For elements of Nested, column_size_before_reading may be greater than column size
                 ///  if offsets are not empty and were already read, but elements are empty.
+
                 if (!column->empty())
                     read_rows = std::max(read_rows, column->size() - column_size_before_reading);
             }
@@ -210,7 +255,7 @@ size_t MergeTreeReaderWide::readRows(
                 e.addMessage("(while reading column " + column_to_read.name + ")");
                 throw;
             }
-
+            // 如果要求读取的行数 max_rows_to_read > 0，但读完后 column 依然为空（说明该列在当前历史 Data Part 中物理文件不存在，例如 ALTER TABLE ADD COLUMN 新增的列）
             if (column->empty() && max_rows_to_read > 0)
                 res_columns[pos] = nullptr;
         }

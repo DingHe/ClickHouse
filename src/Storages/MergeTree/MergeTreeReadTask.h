@@ -14,6 +14,15 @@
 #include <Storages/StorageSnapshot.h>
 #include <boost/core/noncopyable.hpp>
 
+// MergeTreeReadTask.h 定义了 ClickHouse MergeTree 存储引擎在执行读取（SELECT、后台 Merge、Mutation、索引构建等）时的最小工作单元（Task）及其配套元数据、读取器组合与读取链上下文。
+// MergeTreeReadTask 扮演着连接上层调度池（MergeTreeReadPool / MergeTreeSelectProcessor）与底层列式文件读取器（IMergeTreeReader / MergeTreeRangeReader）的桥梁：
+// 封装单次分配的读取工作量：一个 MergeTreeReadTask 代表“从某个特定 Data Part 中读取若干段连续的数据颗粒范围（MarkRanges）”。
+// 解耦“静态 Part 级元数据”与“动态 Task 级执行状态”：
+// 同一张表的同一个 Data Part 可能被拆分成几十个 MergeTreeReadTask 分发给不同线程并发读取。所有线程共享同一份只读的 MergeTreeReadTaskInfo（静态元数据），而各自持有独立的 MergeTreeReadTask（动态进度、mark_ranges、读取器状态）。
+// 编排多阶段延迟物化流水线（MergeTreeReadersChain）：
+// 管理主列读取器（main）、多步 PREWHERE 读取器（prewhere）、轻量级更新补丁读取器（patches）以及二级索引读取器（prepared_index），并在切换相邻任务时支持底层读取器（Readers）的无缝复用（releaseReaders()），避免重复打开磁盘文件与解析 .mrk 索引。
+// 自适应块大小控制与缓存统计追踪：
+// 结合 MergeTreeBlockSizePredictor 动态计算每次读取的行数，同时追踪 PREWHERE 未命中的 Mark 范围（供 QueryConditionCache 使用）以及运行时数据流统计信息。
 namespace DB
 {
 
@@ -253,30 +262,38 @@ private:
     UInt64 estimateNumRows() const;
 
     /// Shared information required for reading.
+    // 指向当前分区的共享只读元数据（MergeTreeReadTaskInfo）。
     MergeTreeReadTaskInfoPtr info;
 
     /// Readers for data_part of this task.
     /// May be reused and released to the next task.
+    // 当前任务持有的底层列读取器集合（main、prewhere、patches、prepared_index）。任务结束时可通过 releaseReaders() 移交给同分区的下一个任务复用。
     Readers readers;
 
     /// Range readers chain to read mark_ranges from data_part.
+    // 读取器流水线链条，负责按顺序串联索引过滤、动态 Mutation、Patch 合并、多步 PREWHERE 过滤以及主列延迟物化读取。
     MergeTreeReadersChain readers_chain;
 
     /// Ranges to read from data_part.
+    // 当前任务尚未读取完毕的主分区 Mark 范围队列。每调用一次 read() 就会从头部消耗掉一部分区间，直到为空。
     MarkRanges mark_ranges;
 
     /// Ranges to read from patch parts.
+    // 与主分区 mark_ranges 对应的各补丁分区（Patch Parts）待读取 Mark 范围列表。
     std::vector<MarkRanges> patches_mark_ranges;
 
     /// Tracks which mark ranges are not matched by PREWHERE (needed for query condition cache)
+    // 累计记录当前任务执行期间所有被 PREWHERE 完全过滤掉的 Mark 范围，任务完成时写入全局 QueryConditionCache。
     MarkRanges prewhere_unmatched_marks;
-
+    // 单块行数与字节数限制参数配置。
     BlockSizeParams block_size_params;
 
     /// Used to satistfy preferred_block_size_bytes limitation
+    // 动态块大小预测器，根据已读列的实际字节大小动态调整下一步读取的行数，使输出块大小贴近 preferred_block_size_bytes。
     MergeTreeBlockSizePredictorPtr size_predictor;
-
+    // 运行时数据流统计缓存更新器，用于在查询执行期间采样收集数据特征（如列基数、过滤率）以优化后续执行计划。
     RuntimeDataflowStatisticsCacheUpdaterPtr updater;
+    // 内部封装的回调函数，用于向 updater 汇报本批次读取的列、部分读取的列集合、读取字节数，并接收 should_continue_sampling 采样控制信号。
     DataflowCacheUpdateCallback dataflow_cache_update_cb;
 };
 

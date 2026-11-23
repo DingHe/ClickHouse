@@ -16,6 +16,13 @@ namespace ErrorCodes
 /// Fake disk transaction implementation.
 /// Just execute all operations immediately, commit is noop operation.
 /// No support for atomicity and rollback.
+// 定义了 ClickHouse 存储层中用于本地磁盘等非事务型存储介质的“伪事务”适配器类 FakeDiskTransaction
+// 接口适配与无痛多态（Adapter Pattern）：
+// 上层存储引擎（如 DataPartStorageOnDiskBase、分区克隆与合并流程）为了同时兼容需要批量元数据事务的对象存储（S3/HDFS）和普通本地磁盘（DiskLocal），
+// 统一通过 disk->createTransaction() 获取 IDiskTransaction 接口编写逻辑。
+// FakeDiskTransaction 作为 IDisk::createTransaction() 的默认返回值，将 IDiskTransaction 接口的方法逐一直接转发给底层 IDisk 实例，使上层代码无需区分当前磁盘是否真正支持事务。
+// 正如类注释所述，该类不维护任何内存命令队列，所有文件/目录写删操作在调用瞬间立即在底层磁盘上真实执行；commit() 和 undo() 均为空操作（No-op），
+// 不提供跨多文件的事务原子性和失败自动回滚能力（本地盘上依赖目录原子 rename 及异常清理逻辑保证完整性）。
 struct FakeDiskTransaction final : public IDiskTransaction
 {
 public:

@@ -36,7 +36,12 @@ namespace Poco
         class AbstractConfiguration;
     }
 }
-
+// IDisk.h 定义了 ClickHouse 存储抽象层的核心接口 IDisk（虚拟文件系统抽象基类），以及配套的空间预留接口 Space、预留凭据 IReservation 和同步守卫 ISyncGuard。
+// IDisk 类的核心作用
+// 屏蔽底层存储介质差异（虚拟文件系统 VFS）：
+// 无论数据存放在本地 POSIX 文件系统（DiskLocal）、远程对象存储（S3/GCS/Azure/HDFS，DiskObjectStorage）、带本地 NVMe 缓存的对象存储（CachedObjectStorage）、透明加密盘（DiskEncrypted）还是纯内存盘（DiskMemory），上层存储引擎（MergeTree、Log 家族、备份恢复模块）均通过统一的 IDisk 接口进行文件和目录操作。
+// 统一空间核算与配额预留（继承自 Space）：
+// 承担磁盘总容量、可用容量、未预留容量统计，以及在写入或后台 Merge 前执行原子空间预留（reserve），防止高并发写入把磁盘写满。
 namespace DB
 {
 
@@ -82,11 +87,14 @@ struct PartitionCommand;
 /**
  * Constraints for disk space reservation to avoid filling up disks.
  */
+// 空间预留安全阈值约束
 struct ReservationConstraints
 {
     /// Min free bytes that must remain on the disk after reservation
+    // 执行空间预留后，磁盘上必须保留的最小可用字节数。
     UInt64 min_bytes = 0;
     /// Min free space ratio that must remain on the disk after reservation
+    // 执行空间预留后，磁盘上必须保留的最小可用空间比例（0.0 ~ 1.0）。
     Float32 min_ratio = 0.0;
 
     ReservationConstraints(UInt64 min_bytes_, Float32 min_ratio_)
@@ -96,22 +104,28 @@ struct ReservationConstraints
 /**
  * Provide interface for reservation.
  */
+// 存储空间预留抽象基类
 class Space : public std::enable_shared_from_this<Space>
 {
 public:
     /// Return the name of the space object.
+    // 返回当前空间对象（磁盘或存储卷）的名称。
     virtual const String & getName() const = 0;
 
     /// Reserve the specified number of bytes.
     /// Returns valid reservation or nullptr when failure.
+    // 尝试预留 bytes 字节空间，成功返回 IReservation 凭据，失败返回 nullptr。
     virtual ReservationPtr reserve(UInt64 bytes) = 0;
 
     /// Reserve the specified number of bytes with constraints.
     /// Returns valid reservation or nullptr when failure (including when constraints are not met).
+    // 带保留空间安全阈值约束的空间预留，不满足阈值时同样返回 nullptr。
     virtual ReservationPtr reserve(UInt64 bytes, const ReservationConstraints & constraints) = 0;
 
     /// Whether this is a disk or a volume.
+    // 标识当前对象是否为单块磁盘（IDisk 重写返回 true）。
     virtual bool isDisk() const { return false; }
+    // 标识当前对象是否为存储卷（IVolume 重写返回 true）。
     virtual bool isVolume() const { return false; }
 
     virtual ~Space() = default;
@@ -123,6 +137,8 @@ using SpacePtr = std::shared_ptr<Space>;
  * A guard, that should synchronize file's or directory's state
  * with storage device (e.g. fsync in POSIX) in its destructor.
  */
+// RAII 刷盘同步守卫
+// RAII 守卫接口，在析构函数中将文件或目录的元数据修改同步刷入底层物理设备（如 POSIX 下的 fsync）；远程对象存储实现为空操作。
 class ISyncGuard
 {
 public:
@@ -142,13 +158,15 @@ using SyncGuardPtr = std::unique_ptr<ISyncGuard>;
 class IDisk : public Space
 {
 public:
+    // 从配置文件节点初始化磁盘名称及通用参数。
     IDisk(const String & name_, const Poco::Util::AbstractConfiguration & config, const String & config_prefix);
     explicit IDisk(const String & name_);
     ~IDisk() override;
 
     /// This is a disk.
+    // 标识本对象为磁盘。
     bool isDisk() const override { return true; }
-
+    // 创建一个磁盘事务对象 IDiskTransaction，用于将多个写/删/硬链接操作打包原子提交（远程对象存储常用）。
     virtual DiskTransactionPtr createTransaction();
 
     /// Root path for all files stored on the disk.
@@ -483,6 +501,7 @@ public:
     virtual void shutdown() {}
 
     /// Performs access check and custom action on disk startup.
+    // 磁盘启动入口：若未跳过检查则调用 checkAccess() 验证读写权限，随后调用 startupImpl()。
     void startup(bool skip_access_check);
 
     /// Performs custom action on disk startup.
@@ -492,6 +511,7 @@ public:
     /// but don't do it more frequently than the specified parameter.
     /// Note: for performance reasons, it's allowed to assume that only some subset of changes are possible
     /// (those that MergeTree tables can make).
+    // 当底层存储状态可能被外部进程/其他节点修改导致内存元数据过期时，按最小间隔参数触发状态刷新（默认空实现）。
     virtual void refresh(UInt64 /* not_sooner_than_milliseconds */)
     {
         /// The default no-op implementation when the state in memory cannot be out of sync of the actual state.
@@ -510,6 +530,7 @@ public:
     virtual SyncGuardPtr getDirectorySyncGuard(const String & path) const;
 
     /// Applies new settings for disk in runtime.
+    // 支持在运行时热加载修改后的磁盘配置参数。
     virtual void applyNewSettings(const Poco::Util::AbstractConfiguration & config, ContextPtr context, const String & config_prefix, const DisksMap & map);
 
     /// Quite leaky abstraction. Some disks can use additional disk to store
@@ -589,6 +610,7 @@ public:
     bool isCaseInsensitive();
 
 protected:
+    // 磁盘在配置文件中定义的唯一名称（如 "default"、"s3_disk"），构造后不可更改
     const String name;
 
     /// Base implementation of the function copy().
@@ -605,14 +627,19 @@ protected:
     virtual void checkAccessImpl(const String & path);
 
 private:
+    // 专用于 copyDirectoryContent 跨盘/跨目录并发拷贝多个文件时的内部线程池（按需懒初始化）。
     std::unique_ptr<ThreadPool> copying_thread_pool;
     // 0 means the disk is not custom, the disk is predefined in the config
+    // 自定义磁盘（未在 config.xml 中预定义，而是通过 SQL SETTINGS disk = disk(...) 动态创建的临时磁盘）的配置哈希值；0 表示配置文件预定义磁盘。
     UInt128 custom_disk_settings_hash = 0;
 
     /// True if underlying filesystem is case-insensitive,
     /// e.g. file_name and FILE_NAME are the same files.
+    // 原子布尔标志，缓存底层文件系统是否大小写不敏感（如 macOS APFS / Windows NTFS）。
     std::atomic_bool is_case_insensitive = false;
+    // 原子布尔标志，记录是否已经完成过大小写敏感性探测（用于双检锁避免重复探测）。
     std::atomic_bool is_case_sensitivity_checked = false;
+    // 互斥锁，保护首次执行大小写敏感性探测时的并发安全。
     std::mutex case_sensitivity_check_mutex;
 
     /// Check access to the disk.
@@ -624,23 +651,29 @@ using Disks = std::vector<DiskPtr>;
 /**
  * Information about reserved size on particular disk.
  */
+// 已预留磁盘空间凭据
 class IReservation : boost::noncopyable
 {
 public:
     /// Get reservation size.
+    // 获取当前预留凭据锁定的字节数。
     virtual UInt64 getSize() const = 0;
 
     /// Space available for reservation
     /// (with this reservation already take into account).
+    // 获取所在磁盘扣除本次及所有其他预留后剩余的未预留可用字节数。
     virtual std::optional<UInt64> getUnreservedSpace() const = 0;
 
     /// Get i-th disk where reservation take place.
+    // 获取第 i 块发生预留的磁盘智能指针。
     virtual DiskPtr getDisk(size_t i = 0) const = 0; /// NOLINT
 
     /// Get all disks, used in reservation
+    // 获取本次预留涉及的所有磁盘列表。
     virtual Disks getDisks() const = 0;
 
     /// Changes amount of reserved space.
+    // 动态调整已预留的空间大小（例如写入实际大小小于预估大小时释放多余预留）。
     virtual void update(UInt64 new_size) = 0;
 
     /// Unreserves reserved space.
@@ -648,12 +681,14 @@ public:
 };
 
 /// Return full path to a file on disk.
+// 将 disk->getPath() 与相对路径 path 拼接为完整绝对路径。
 inline String fullPath(const DiskPtr & disk, const String & path)
 {
     return fs::path(disk->getPath()) / path;
 }
 
 /// Return parent path for the specified path.
+// 返回指定路径的父目录路径（末尾带 /）。
 inline String parentPath(const String & path)
 {
     if (path == "/")
@@ -664,12 +699,14 @@ inline String parentPath(const String & path)
 }
 
 /// Return file name for the specified path.
+// 提取路径末尾的文件名部分。
 inline String fileName(const String & path)
 {
     return fs::path(path).filename();
 }
 
 /// Return directory path for the specified path.
+// 提取文件所属的目录路径（末尾带 /）。
 inline String directoryPath(const String & path)
 {
     return fs::path(path).parent_path() / "";
@@ -678,6 +715,7 @@ inline String directoryPath(const String & path)
 
 }
 
+// 可以直接传入 ClickHouse 的 fmt 日志和异常格式化字符串中。
 template <>
 struct fmt::formatter<fs::path> : fmt::formatter<std::string>
 {

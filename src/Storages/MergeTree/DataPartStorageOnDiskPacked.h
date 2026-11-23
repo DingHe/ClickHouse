@@ -11,12 +11,21 @@ namespace DB
 
 /// A storage for data part that stores all files of part in one archive
 /// (except projections and several files listed below).
+// DataPartStorageOnDiskPacked 类的核心作用
+// 将 Data Part 大部分文件打包进单一归档文件（data.packed）的存储实现（MergeTreeDataPartStorageType::Packed）：
+// 与 DataPartStorageOnDiskFull 将每个文件原样散落存放不同，DataPartStorageOnDiskPacked 将分区内绝大多数文件合并写入单个归档文件 data<ARCHIVE_EXTENSION>（即 data.packed），以减少小文件数量、降低对象存储请求次数与元数据开销。
+// 例外文件与投影：投影（Projection）子目录以及 files_written_separately 集合中列出的控制/元数据文件（如 delete-on-destroy.txt、txn_version.txt、invalidated_system_columns.txt）会单独写入/存放，不混入打包归档。
+// 归档读写与事务预提交协调（PackedFilesReader + PackedFilesWriter）：
+// 写入/变更通常在事务内进行：通过 PackedFilesWriter 缓冲归档内逻辑文件与顺序（preferred_file_order），在 precommitTransaction() 时完成写入器收尾（finalizeWriter()）并将数据刷入事务；读取时通过 PackedFilesReader 按索引定位偏移与大小，并支持内嵌归档（如归档内的 skp_idx.packed）的读取路由。
+
 class DataPartStorageOnDiskPacked final : public DataPartStorageOnDiskBase
 {
 public:
+    // 打包归档文件的扩展名常量（通常为 .packed）。
     static constexpr auto DATA_FILE_EXTENSION = PackedFilesIO::ARCHIVE_EXTENSION;
+    // 分区主打包归档文件名（即 "data.packed"）。
     inline static const String DATA_FILE_NAME = String("data") + DATA_FILE_EXTENSION;
-
+    // 必须独立于 data.packed 单独写入/管理的文件名集合，涉及分区销毁标记、事务版本与失效系统列信息。
     inline static const std::unordered_set<String> files_written_separately =
     {
         "delete-on-destroy.txt",
@@ -119,13 +128,16 @@ public:
 private:
     /// Reader is initialized from index of archive if file
     /// with archive exists or after finalization of writer.
+    // 归档读取器实例（可选包装）。
+    // 当归档文件已存在或在写入器收尾后初始化，用于依据归档索引定位并读取归档内逻辑文件。
     std::optional<PackedFilesReader> reader;
 
     /// Writer is initialized after creating a disk transaction.
+    // 归档写入器实例（可选包装）。通常在开启磁盘事务并初始化写入上下文后构建，用于在事务阶段收集归档内文件写入与元数据。
     std::optional<PackedFilesWriter> writer;
-
+    // 标识当前事务是否已经执行过 precommitTransaction()（归档写入器已完成收尾并纳入事务），防止重复预提交或状态错乱。
     bool is_precommitted = false;
-
+    // 写入归档时偏好的逻辑文件排列顺序列表，用于优化顺序读取或特定布局下的归档组织。
     Strings preferred_file_order;
 
     String getRelativeDataPath() const;

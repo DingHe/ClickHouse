@@ -543,7 +543,7 @@ IMergeTreeReader::findColumnForOffsets(const NameAndTypePair & required_column) 
 
     return result;
 }
-
+// 用于确保上层调用者传入的输出列容器与当前读取器初始化的列数量严格一致。
 void IMergeTreeReader::checkNumberOfColumns(size_t num_columns_to_read) const
 {
     if (num_columns_to_read != getColumns().size())

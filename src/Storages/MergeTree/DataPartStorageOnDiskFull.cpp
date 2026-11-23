@@ -152,13 +152,19 @@ std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskFull::readFileIfExi
 {
     return volume->getDisk()->readFileIfExists(fs::path(root_path) / part_dir / name, settings, read_hint);
 }
-
+// const String & name：待写入的逻辑文件名（相对于当前 Data Part 目录的相对路径，例如某列的 .bin 数据文件、.mrk2 标记文件或 checksums.txt 等）。
+// size_t buf_size：写入缓冲区的字节大小，用于控制 WriteBufferFromFileBase 的缓冲粒度与系统调用/对象上传频率。
+// WriteMode mode：文件写入模式枚举（如 WriteMode::Rewrite 覆盖写入或 WriteMode::Append 追加写入）。
+// const WriteSettings & settings：文件写入配置结构体（涵盖并发度、对象存储上传参数、限速/重试设置等）。
 std::unique_ptr<WriteBufferFromFileBase> DataPartStorageOnDiskFull::writeFile(
     const String & name,
     size_t buf_size,
     WriteMode mode,
     const WriteSettings & settings)
 {
+    // 事务内写入分支
+    // 若当前存在活跃的 transaction（transaction != nullptr），将 fs::path(root_path) / part_dir / name 拼接为完整逻辑路径，连同 buf_size、mode、settings 转发给 transaction->writeFile(...)。
+    // 这样新写入的数据或关联的 Blob/元数据变更会纳入事务生命周期（如在事务提交时生效，或在 undo() 时清理）。
     if (transaction)
         return transaction->writeFile(fs::path(root_path) / part_dir / name, buf_size, mode, settings);
     return volume->getDisk()->writeFile(fs::path(root_path) / part_dir / name, buf_size, mode, settings);
@@ -239,10 +245,12 @@ void DataPartStorageOnDiskFull::createProjection(const std::string & name)
 
 void DataPartStorageOnDiskFull::beginTransaction()
 {
+    // 重入/未提交事务检查（防状态覆盖）
+    // 若 transaction 非空（即当前存储上已经存在一个尚未提交或尚未清理的事务），说明调用方出现了嵌套开启或遗漏 commitTransaction() 的逻辑错误。
     if (transaction)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "Uncommitted{}transaction already exists", has_shared_transaction ? " shared " : " ");
-
+    // 创建并绑定底层磁盘事务
     transaction = volume->getDisk()->createTransaction();
 }
 

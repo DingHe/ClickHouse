@@ -17,7 +17,9 @@ namespace ErrorCodes
 
 struct RemoveRequest
 {
+    // 待删除文件相对于磁盘根目录的相对路径
     std::string path; /// Relative path.
+    // 容错标志；为 true 时若文件不存在则静默忽略，为 false 时若文件不存在则抛出异常。
     bool if_exists = false;
 
     explicit RemoveRequest(std::string path_, bool if_exists_ = false)
@@ -30,16 +32,25 @@ using RemoveBatchRequest = std::vector<RemoveRequest>;
 
 /// Simple interface batch execution of write disk operations.
 /// Method are almost equal to disk methods.
+// 定义了 ClickHouse 存储层用于批量收集与原子提交磁盘写操作的事务接口 IDiskTransaction，以及批量删除请求结构体 RemoveRequest / RemoveBatchRequest。
+// IDiskTransaction 的核心作用
+// 批量化执行磁盘写操作（Operation Batching）：
+// 在 S3、HDFS 等远程对象存储磁盘（DiskObjectStorage）上，每个文件的创建、移动、硬链接或删除都需要更新底层元数据存储（如 ZooKeeper/Keeper 或本地 RocksDB 元数据）。IDiskTransaction 提供了一套与 IDisk 几乎一致的写入接口，调用方在事务内执行的所有修改都会先缓存在内存操作队列中，最后通过一次 commit() 批量提交，极大减少网络往返（RTT）和元数据锁竞争。
+// 保证多文件修改的原子性与异常回滚（Atomicity & Rollback）：
+// 写入一个 Data Part 或执行一次 freeze 克隆往往涉及数十上百个文件。通过 IDiskTransaction，所有元数据变更要么全部原子生效（commit / tryCommit），要么在发生异常或取消时通过 undo() 彻底撤销并清理已上传的孤儿 Blob，避免留下残缺的脏目录状态。
+//
 struct IDiskTransaction : private boost::noncopyable
 {
 public:
+    // 原子提交事务中积累的所有磁盘写入、目录创建、硬链接和删除操作；提交失败时抛出异常。
     virtual void commit() = 0;
 
+    // 尝试以指定选项（如绑定外部 Keeper 会话执行联合原子提交）提交事务，返回提交结果变体 TransactionCommitOutcomeVariant；默认实现抛出 NOT_IMPLEMENTED 异常。
     virtual TransactionCommitOutcomeVariant tryCommit(const TransactionCommitOptionsVariant &)
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Commit with ZK connection not implemented");
     }
-
+    // 无异常回滚（noexcept）。撤销事务中所有未提交的元数据修改，并清理本次事务期间已经上传到对象存储的临时/孤儿数据 Blob，确保不产生状态污染或存储泄漏。
     virtual void undo() noexcept = 0;
 
     virtual ~IDiskTransaction() = default;
@@ -84,7 +95,7 @@ public:
         size_t buf_size,
         WriteMode mode,
         const WriteSettings & settings) = 0;
-
+    // 用于自定义写入远端对象存储 Blob 的回调函数。
     using WriteBlobFunction = std::function<size_t(const Strings & blob_path, WriteMode mode, const std::optional<ObjectAttributes> & object_attributes)>;
 
     /// Write a file using a custom function to write an object to the disk's object storage.

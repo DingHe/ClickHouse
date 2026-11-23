@@ -608,12 +608,17 @@ void MultipleDisksObjectStorageTransaction::copyFile(const std::string & from_fi
 
 void DiskObjectStorageTransaction::commit()
 {
+    // 1. 协调器组件标注与急切执行断言
     auto component_guard = Coordination::setCurrentComponent("DiskObjectStorageTransaction::commit");
+    // 若 metadata_storage->appliesOperationsEagerly() 为 true（元数据存储采用急切执行模式，操作在加入时已立即执行）
+    // 则 operations_to_execute 应当为空；否则说明急切模式与延迟队列状态不一致。
     chassert(operations_to_execute.empty() || !metadata_storage->appliesOperationsEagerly());
+    // 2. 顺序执行暂存的元数据操作与失败回滚
     for (size_t i = 0; i < operations_to_execute.size(); ++i)
     {
         try
         {
+            // 每一个操作闭包（按索引 0 至 size() - 1 顺序执行），将其绑定到当前 metadata_transaction 上运行，把高层的路径/目录/硬链接/引用计数变更组装进 metadata_transaction。
             operations_to_execute[i](metadata_transaction);
         }
         catch (...)
@@ -627,14 +632,14 @@ void DiskObjectStorageTransaction::commit()
             throw;
         }
     }
-
+    // 3. 故障注入点与提交底层元数据事务
     try
     {
         fiu_do_on(FailPoints::disk_object_storage_fail_commit_metadata_transaction,
         {
             throw Exception(ErrorCodes::FAULT_INJECTED, "disk_object_storage_fail_commit_metadata_transaction");
         });
-
+        // 调用底层 metadata_transaction->commit(NoCommitOptions{})，传入空提交选项 NoCommitOptions{}，原子提交本轮累积的所有元数据变更。
         metadata_transaction->commit(NoCommitOptions{});
     }
     catch (...)
@@ -642,7 +647,8 @@ void DiskObjectStorageTransaction::commit()
         undo();
         throw;
     }
-
+    // 4. 可选等待 Blob 清理、清理事务临时状态与记录完成日志
+    // 元数据事务提交成功后，若 wait_blob_removal 为 true，从 metadata_transaction->getSubmittedForRemovalBlobs() 获取本次事务登记待删除的 Blob 列表，并调用 waitBlobRemoval(...) 阻塞等待相关后台清理任务完成。
     if (wait_blob_removal)
         waitBlobRemoval(metadata_transaction->getSubmittedForRemovalBlobs());
 
